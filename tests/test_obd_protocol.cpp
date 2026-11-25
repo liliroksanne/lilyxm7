@@ -84,23 +84,23 @@ static void testTempTrackerTrendsAndSignalLoss() {
   assert(tracker.reading().hasLiveSignal);
   assert(tracker.reading().hasLastValue);
   assert(tracker.reading().tempC == 85);
-  assert(tracker.reading().trend == TempTrend::NONE);
+  assert(tracker.reading().trend == TempTrend::TREND_NONE);
 
   // Sube a 88 °C
   tracker.recordValidReading(88, 1500);
   assert(tracker.reading().tempC == 88);
   assert(tracker.reading().previousTempC == 85);
   assert(tracker.reading().deltaC == 3);
-  assert(tracker.reading().trend == TempTrend::RISING);
+  assert(tracker.reading().trend == TempTrend::TREND_UP);
 
   // Se mantiene estable en 88 °C
   tracker.recordValidReading(88, 2000);
-  assert(tracker.reading().trend == TempTrend::STABLE);
+  assert(tracker.reading().trend == TempTrend::TREND_STABLE);
   assert(tracker.reading().deltaC == 0);
 
   // Baja a 86 °C
   tracker.recordValidReading(86, 2500);
-  assert(tracker.reading().trend == TempTrend::FALLING);
+  assert(tracker.reading().trend == TempTrend::TREND_DOWN);
   assert(tracker.reading().deltaC == -2);
 
   // Aún dentro del timeout (3000 ms)
@@ -117,7 +117,7 @@ static void testTempTrackerTrendsAndSignalLoss() {
   tracker.recordValidReading(87, 7000);
   assert(tracker.reading().hasLiveSignal);
   assert(tracker.reading().tempC == 87);
-  assert(tracker.reading().trend == TempTrend::RISING);
+  assert(tracker.reading().trend == TempTrend::TREND_UP);
 }
 
 int main() {

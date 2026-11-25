@@ -6,9 +6,17 @@ el menú físico (↑, ↓, A, B), el potenciómetro virtual (20..120 °C), las 
 y la pérdida de señal ("Sin datos del auto" + "Última lectura").
 """
 
+import sys
 import time
+import traceback
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tools.run_logged import log_line
+
+LOG_COMPONENT = "simulador_local"
 
 # Paleta Matrix
 BG = "#000000"
@@ -256,25 +264,30 @@ class LilySimApp:
 
         self.poll_data()
         self.tick_anim()
+        log_line(LOG_COMPONENT, "Simulador local iniciado (20..120 °C, timeout 3.0s)")
 
     def on_up(self) -> None:
         if self.screen == "MAIN_MENU":
             self.selected_idx = (self.selected_idx - 1) % 2
+            log_line(LOG_COMPONENT, f"BTN UP -> opcion={self.selected_idx}")
             self.render()
 
     def on_down(self) -> None:
         if self.screen == "MAIN_MENU":
             self.selected_idx = (self.selected_idx + 1) % 2
+            log_line(LOG_COMPONENT, f"BTN DOWN -> opcion={self.selected_idx}")
             self.render()
 
     def on_a(self) -> None:
         if self.screen == "MAIN_MENU":
             self.screen = "TEMPERATURE" if self.selected_idx == 0 else "CONNECTION_STATUS"
+            log_line(LOG_COMPONENT, f"BTN A -> pantalla={self.screen}")
             self.render()
 
     def on_b(self) -> None:
         if self.screen != "MAIN_MENU":
             self.screen = "MAIN_MENU"
+            log_line(LOG_COMPONENT, "BTN B -> pantalla=MAIN_MENU")
             self.render()
 
     def poll_data(self) -> None:
@@ -282,6 +295,8 @@ class LilySimApp:
         self.tx_requests += 1
 
         if self.signal_on.get():
+            was_offline = not self.reading.has_live_signal
+            prev_temp = self.reading.temp_c
             new_temp = int(self.pot_temp.get())
             if not self.reading.has_last_value:
                 self.reading.previous_temp_c = new_temp
@@ -309,10 +324,20 @@ class LilySimApp:
                 f"OBD-II 01 05 | TX 7DF#0201050000000000  -->  "
                 f"RX 7E8#034105{byte_a:02X}00000000  (A={byte_a} -> {new_temp} °C)"
             )
+            if was_offline or new_temp != prev_temp:
+                log_line(
+                    LOG_COMPONENT,
+                    f"LECTURA temp={new_temp}C trend={self.reading.trend} delta={self.reading.delta_c:+d}C byteA=0x{byte_a:02X}",
+                )
         else:
             elapsed = now - self.reading.last_valid_ts if self.reading.has_last_value else SIGNAL_TIMEOUT_SEC
             if self.reading.has_live_signal and elapsed >= SIGNAL_TIMEOUT_SEC:
                 self.reading.has_live_signal = False
+                log_line(
+                    LOG_COMPONENT,
+                    f"SIN DATOS DEL AUTO | ultima_lectura={self.reading.temp_c}C" if self.reading.has_last_value else "SIN DATOS DEL AUTO | sin lecturas previas",
+                    level="WARN",
+                )
             rem = max(0.0, SIGNAL_TIMEOUT_SEC - elapsed)
             if self.reading.has_live_signal:
                 self.last_can_log = f"OBD-II 01 05 | TX 7DF#020105... sin respuesta (timeout en {rem:.1f}s)"
@@ -473,9 +498,21 @@ class LilySimApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    LilySimApp(root)
-    root.mainloop()
+    def _on_tk_error(exc_type, exc_val, exc_tb) -> None:
+        tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+        log_line(LOG_COMPONENT, f"Excepcion en UI:\n{tb_text}", level="ERROR")
+        sys.stderr.write(tb_text)
+
+    try:
+        root = tk.Tk()
+        root.report_callback_exception = _on_tk_error  # type: ignore[method-assign]
+        LilySimApp(root)
+        root.mainloop()
+        log_line(LOG_COMPONENT, "Simulador local cerrado por el usuario.")
+    except Exception:
+        tb_text = traceback.format_exc()
+        log_line(LOG_COMPONENT, f"Error fatal:\n{tb_text}", level="ERROR")
+        raise
 
 
 if __name__ == "__main__":

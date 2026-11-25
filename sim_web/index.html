@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>lilyxm7 — Simulador Web Local (ESP32-S3 + TFT 2.4" + OBD-II)</title>
+  <style>
+    :root {
+      --bg: #030804;
+      --panel: #071209;
+      --border: #0b4f1b;
+      --bright: #00ff41;
+      --mid: #00b82e;
+      --dim: #0c7524;
+      --glow: #a8ffb8;
+      --warn: #ffb833;
+      --danger: #ff4f4f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 18px;
+      background: radial-gradient(circle at top, #071b0b 0%, var(--bg) 60%);
+      color: var(--bright);
+      font-family: Consolas, "Courier New", monospace;
+      min-height: 100vh;
+    }
+    .app { max-width: 1180px; margin: 0 auto; }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 12px 16px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 10px;
+      margin-bottom: 16px;
+    }
+    .brand h1 { margin: 0; font-size: 20px; letter-spacing: 1px; }
+    .brand small { color: var(--mid); font-size: 12px; }
+    .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .badge {
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: bold;
+      border: 1px solid var(--border);
+    }
+    .badge.cpp { background: #003810; color: var(--glow); border-color: var(--bright); }
+    .badge.preview { background: #332200; color: var(--warn); border-color: var(--warn); }
+    .btn {
+      background: #0a2910;
+      color: var(--bright);
+      border: 1px solid var(--mid);
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .btn:hover { background: var(--bright); color: #000; }
+    .btn.primary { background: var(--bright); color: #000; border-color: var(--bright); }
+    .btn.primary:hover { background: var(--glow); }
+    .btn.warn { border-color: var(--warn); color: var(--warn); }
+    .btn.warn:hover { background: var(--warn); color: #000; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 676px 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 1060px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .card-title {
+      font-size: 13px;
+      color: var(--glow);
+      font-weight: bold;
+      margin: 0 0 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .bezel {
+      background: #140505;
+      border: 3px solid #591616;
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 0 28px rgba(0, 255, 65, 0.14);
+      position: relative;
+    }
+    .bezel-label {
+      font-size: 10px;
+      color: #d98282;
+      letter-spacing: 1px;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    canvas#tft {
+      width: 640px;
+      height: 480px;
+      max-width: 100%;
+      background: #000;
+      display: block;
+      image-rendering: pixelated;
+      border: 1px solid #0b3d16;
+    }
+    .hw-buttons {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .pad-btn {
+      background: #08200c;
+      color: var(--bright);
+      border: 2px solid var(--mid);
+      border-radius: 8px;
+      padding: 12px 6px;
+      font-family: inherit;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: transform 0.05s, background 0.1s;
+    }
+    .pad-btn small { display: block; font-size: 10px; color: var(--mid); margin-top: 2px; }
+    .pad-btn:active, .pad-btn.active {
+      transform: scale(0.96);
+      background: var(--bright);
+      color: #000;
+    }
+    .pad-btn:active small, .pad-btn.active small { color: #000; }
+
+    .ctrl-group {
+      border: 1px solid #0a3814;
+      background: #040c06;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .ctrl-group h3 { margin: 0 0 8px; font-size: 13px; color: var(--glow); }
+    .temp-display {
+      font-size: 28px;
+      font-weight: bold;
+      color: var(--bright);
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+    .temp-display span.sub { font-size: 12px; color: var(--mid); }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--bright);
+      cursor: pointer;
+    }
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .presets .btn { padding: 5px 8px; font-size: 11px; }
+    .switch-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin: 6px 0;
+    }
+    .mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .mode-btn {
+      padding: 9px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #061709;
+      color: var(--mid);
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .mode-btn.selected {
+      background: var(--bright);
+      color: #000;
+      border-color: var(--bright);
+    }
+
+    .gpio-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .gpio-pill {
+      font-size: 11px;
+      padding: 5px 6px;
+      border-radius: 5px;
+      border: 1px solid #0a3814;
+      background: #030a04;
+      color: var(--dim);
+      text-align: center;
+    }
+    .gpio-pill.on {
+      border-color: var(--bright);
+      background: #063010;
+      color: var(--glow);
+      box-shadow: 0 0 8px rgba(0, 255, 65, 0.35);
+    }
+
+    .console-card { margin-top: 16px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .tab-btn {
+      background: #051308;
+      color: var(--mid);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .tab-btn.active { background: var(--bright); color: #000; font-weight: bold; }
+    pre.console {
+      margin: 0;
+      background: #010501;
+      border: 1px solid #0a3814;
+      border-radius: 6px;
+      padding: 10px;
+      height: 185px;
+      overflow-y: auto;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #79f295;
+      white-space: pre-wrap;
+    }
+    .banner {
+      display: none;
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--warn);
+      background: #241900;
+      color: #ffd98a;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div class="brand">
+        <h1>LILYXM7 v1.0 // SIMULADOR WEB LOCAL</h1>
+        <small>Suzuki Grand Vitara 2008 V6 2.7L — ESP32-S3 + TFT 2.4" ILI9341 + OBD-II 01 05 (100% offline)</small>
+      </div>
+      <div class="badges">
+        <span id="engineBadge" class="badge preview">CARGANDO...</span>
+        <button class="btn primary" onclick="recompileCpp()">↻ Recompilar C++</button>
+        <button class="btn" onclick="resetBoard()">⟳ Reiniciar ESP32</button>
+      </div>
+    </div>
+
+    <div id="previewBanner" class="banner"></div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">
+          <span>PANTALLA TFT 2.4" ILI9341 (320×240 px reales)</span>
+          <span id="fpsLabel" style="color: var(--mid); font-size: 11px;">100% local</span>
+        </div>
+        <div class="bezel">
+          <div class="bezel-label">
+            <span>2.4" SPI TFT ILI9341 // CS:10 DC:9 RST:14 MOSI:11 SCK:12</span>
+            <span id="modeBanner">MODO: SIMULACIÓN</span>
+          </div>
+          <canvas id="tft" width="320" height="240"></canvas>
+        </div>
+
+        <div class="hw-buttons">
+          <button id="btn4" class="pad-btn" onclick="pressBtn(4)">↑<small>GPIO 4 (Tecla ↑)</small></button>
+          <button id="btn5" class="pad-btn" onclick="pressBtn(5)">↓<small>GPIO 5 (Tecla ↓)</small></button>
+          <button id="btn6" class="pad-btn" onclick="pressBtn(6)">A<small>GPIO 6 (Tecla A)</small></button>
+          <button id="btn7" class="pad-btn" onclick="pressBtn(7)">B<small>GPIO 7 (Tecla B)</small></button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span>BANCO DE PRUEBAS HARDWARE</span></div>
+
+        <div class="ctrl-group">
+          <h3>Modo de entrada de datos</h3>
+          <div class="mode-tabs">
+            <button id="modeSim" class="mode-btn selected" onclick="setMode('sim')">SIMULACIÓN<br /><small>Potenciómetro (Wokwi)</small></button>
+            <button id="modeObd" class="mode-btn" onclick="setMode('obd')">OBD-II CAN REAL<br /><small>Vitara TWAI 01 05</small></button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <h3>Temperatura Refrigerante (Potenciómetro / ECU)</h3>
+          <div class="temp-display">
+            <span id="tempVal">86 °C</span>
+            <span id="byteAVal" class="sub">OBD byte A = 0x7E (126)</span>
+          </div>
+          <input id="tempSlider" type="range" min="20" max="120" value="86" oninput="onTempChange(this.value)" />
+          <div class="presets">
+            <button class="btn" onclick="setTempPreset(35)">35°C Frío</button>
+            <button class="btn" onclick="setTempPreset(72)">72°C Calent.</button>
+            <button class="btn" onclick="setTempPreset(89)">89°C Óptimo</button>
+            <button class="btn warn" onclick="setTempPreset(102)">102°C Alta</button>
+            <button class="btn warn" onclick="setTempPreset(114)">114°C Peligro</button>
+            <button id="warmupBtn" class="btn" onclick="toggleWarmup()">▶ Auto-calentar</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <h3>Pérdida de señal y Bus CAN</h3>
+          <div class="switch-row">
+            <span>Estado de señal ECU (GPIO 2 / CAN):</span>
+            <button id="signalBtn" class="btn primary" onclick="toggleSignal()">● ECU ACTIVA</button>
+          </div>
+          <div class="switch-row">
+            <span style="font-size: 11px; color: var(--mid);">Al apagar, tras 3 s muestra «Sin datos del auto» + «Última lectura».</span>
+            <button class="btn warn" onclick="triggerBusOff()">⚡ BUS_OFF</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group" style="margin-bottom: 0;">
+          <h3>ESP32-S3 GPIOs en vivo</h3>
+          <div class="gpio-grid">
+            <div id="gpio1" class="gpio-pill on">IO1 POT</div>
+            <div id="gpio2" class="gpio-pill on">IO2 SIG</div>
+            <div id="gpio4" class="gpio-pill">IO4 ↑</div>
+            <div id="gpio5" class="gpio-pill">IO5 ↓</div>
+            <div id="gpio6" class="gpio-pill">IO6 A</div>
+            <div id="gpio7" class="gpio-pill">IO7 B</div>
+            <div id="gpio17" class="gpio-pill">IO17 CTX</div>
+            <div id="gpio18" class="gpio-pill">IO18 CRX</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card console-card">
+      <div class="tabs">
+        <button id="tabSerial" class="tab-btn active" onclick="switchTab('serial')">Monitor Serial (logs/sim_web.log)</button>
+        <button id="tabCan" class="tab-btn" onclick="switchTab('can')">Bus CAN OBD-II (0x7DF / 0x7E8)</button>
+        <button id="tabBuild" class="tab-btn" onclick="switchTab('build')">Log Compilación C++</button>
+      </div>
+      <pre id="consoleOut" class="console">Iniciando simulador...</pre>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("tft");
+    const ctx = canvas.getContext("2d");
+    const imgData = ctx.createImageData(320, 240);
+
+    let activeTab = "serial";
+    let currentState = null;
+    let signalOn = true;
+    let warmupTimer = null;
+
+    async function postJson(url, body = {}) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return res.json();
+    }
+
+    function flashButton(pin) {
+      const el = document.getElementById("btn" + pin);
+      if (!el) return;
+      el.classList.add("active");
+      setTimeout(() => el.classList.remove("active"), 130);
+    }
+
+    async function pressBtn(pin) {
+      flashButton(pin);
+      await postJson("/api/button", { pin });
+    }
+
+    async function onTempChange(val) {
+      const t = parseInt(val, 10);
+      document.getElementById("tempVal").textContent = `${t} °C`;
+      const byteA = Math.max(0, Math.min(255, t + 40));
+      document.getElementById("byteAVal").textContent = `OBD byte A = 0x${byteA.toString(16).toUpperCase().padStart(2, "0")} (${byteA})`;
+      await postJson("/api/inputs", { tempC: t });
+    }
+
+    function setTempPreset(t) {
+      document.getElementById("tempSlider").value = t;
+      onTempChange(t);
+    }
+
+    function toggleWarmup() {
+      const btn = document.getElementById("warmupBtn");
+      if (warmupTimer) {
+        clearInterval(warmupTimer);
+        warmupTimer = null;
+        btn.textContent = "▶ Auto-calentar";
+        return;
+      }
+      setTempPreset(30);
+      btn.textContent = "■ Detener";
+      warmupTimer = setInterval(() => {
+        const sl = document.getElementById("tempSlider");
+        let v = parseInt(sl.value, 10) + 3;
+        if (v > 116) v = 30;
+        setTempPreset(v);
+      }, 900);
+    }
+
+    async function toggleSignal() {
+      signalOn = !signalOn;
+      updateSignalButton();
+      await postJson("/api/inputs", { signalOn });
+    }
+
+    function updateSignalButton() {
+      const btn = document.getElementById("signalBtn");
+      if (signalOn) {
+        btn.textContent = "● ECU ACTIVA";
+        btn.className = "btn primary";
+      } else {
+        btn.textContent = "○ SIN SEÑAL";
+        btn.className = "btn warn";
+      }
+    }
+
+    async function setMode(mode) {
+      await postJson("/api/mode", { mode });
+    }
+
+    async function resetBoard() {
+      await postJson("/api/reset");
+    }
+
+    async function triggerBusOff() {
+      await postJson("/api/busoff");
+    }
+
+    async function recompileCpp() {
+      document.getElementById("consoleOut").textContent = "Recompilando archivos C++ de lilyxm7/...";
+      switchTab("build");
+      await postJson("/api/recompile");
+    }
+
+    function switchTab(tab) {
+      activeTab = tab;
+      for (const id of ["Serial", "Can", "Build"]) {
+        document.getElementById("tab" + id).classList.toggle("active", tab === id.toLowerCase());
+      }
+      renderConsole();
+    }
+
+    function renderConsole() {
+      if (!currentState) return;
+      const pre = document.getElementById("consoleOut");
+      let lines = [];
+      if (activeTab === "serial") lines = currentState.serialLines || [];
+      else if (activeTab === "can") lines = currentState.canLines || [];
+      else lines = currentState.buildLog || [];
+      const text = lines.join("\n") || "(sin registros aun)";
+      if (pre.textContent !== text) {
+        pre.textContent = text;
+        pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    // Renderizador de respaldo en Canvas 2D cuando aun no se instala g++
+    function getPreviewMood(p) {
+      if (p.screen === "MAIN_MENU") return [p.hasLiveSignal ? "MENU_IDLE" : "NO_SIGNAL", p.hasLiveSignal ? "EN LINEA" : "EN ESPERA", p.isSimulated ? "Modo simulación listo." : "Lista para la Vitara.", "Usa ↑/↓ y A para entrar.", false];
+      if (p.screen === "CONNECTION_STATUS") return p.hasLiveSignal ? ["OPTIMAL", "ENLACE OK", p.isSimulated ? "Enlace virtual activo." : "ECU respondiendo 01 05.", "Pulsa B para volver.", false] : ["NO_SIGNAL", "SIN SEÑAL", "Sin datos del auto.", p.hasLastValue ? "Última lectura guardada." : "Esperando respuesta ECU.", true];
+      if (!p.hasLiveSignal) return ["NO_SIGNAL", "SIN SEÑAL", p.hasLastValue ? "Sin datos. Guardé última." : "Sin datos del auto...", p.hasLastValue ? `Conservando última: ${p.tempC}°C` : "Revisa ignición o cable OBD", true];
+      const l2 = p.trend === "UP" ? `Subió +${p.deltaC}°C desde ${p.previousTempC}°C` : p.trend === "DOWN" ? `Bajó ${p.deltaC}°C desde ${p.previousTempC}°C` : p.trend === "STABLE" ? `Estable respecto a ${p.previousTempC}°C` : "Primera lectura válida";
+      if (p.tempC <= 59) return ["COLD", "MOTOR FRIO", p.trend === "UP" ? "Subiendo, buen arranque." : "Motor frío, acelera suave.", l2, false];
+      if (p.tempC <= 79) return ["WARMING", "CALENTANDO", p.trend === "UP" ? "Subiendo a punto ideal." : "Tomando temperatura.", l2, false];
+      if (p.tempC <= 97) return ["OPTIMAL", "OPTIMO", p.trend === "UP" ? "Subió, pero sigue ideal." : p.trend === "DOWN" ? "Bajó, todo bajo control." : "Vitara en temp óptima.", l2, false];
+      if (p.tempC <= 107) return ["WARM_WARN", "TEMP ALTA", p.trend === "UP" ? "¡Subió! Vigila el motor." : "Temperatura alta, alerta.", l2, true];
+      return ["OVERHEAT", "PELIGRO!", "¡PELIGRO! Sobrecalent.", l2, true];
+    }
+
+    function getAscii(mood, blink) {
+      const top = mood === "OVERHEAT" ? " ! .---=======---. ! " : "   .---=======---.   ";
+      const face = {
+        MENU_IDLE: [blink ? " || |  -     -  | || " : " || |  ^     ^  | || ", " || |     .     | || ", " | \\ \\   \\_/   / / | ", " |  \\ '-------' /  | "],
+        COLD:      [blink ? " || |  -     -  | || " : " || |  >     <  | || ", " || |     .     | || ", " | \\ \\   ~~~   / / | ", " |  \\ '-------' /  | "],
+        WARMING:   [blink ? " || |  -     -  | || " : " || |  o     o  | || ", " || |     .     | || ", " | \\ \\    v    / / | ", " |  \\ '-------' /  | "],
+        OPTIMAL:   [blink ? " || |  -     -  | || " : " || |  ^     ^  | || ", " || |   * . *   | || ", " | \\ \\  \\___/  / / | ", " |  \\ '-------' /  | "],
+        WARM_WARN: [blink ? " || |  -    -'  | || " : " || |  O    O'  | || ", " || |     .     | || ", " | \\ \\    o    / / | ", " |  \\ '-------' /  | "],
+        OVERHEAT:  [blink ? " || |  >     <  | || " : " || |  X     X  | || ", " || |     !     | || ", " | \\ \\   ===   / / | ", " !  \\ '-------' /  ! "],
+        NO_SIGNAL: [blink ? " || |  -     -  | || " : " || |  ?     ?  | || ", " || |     .     | || ", " | \\ \\   ___   / / | ", " |  \\ '-------' /  | "],
+      }[mood];
+      return [top, "  / .-/|||||||\\-. \\  ", " | / /  _   _  \\ \\ | ", ...face, " |   '.__   __.'   | ", " |  .--/ | | \\--.  | ", " \\_/  | [010] |  \\_/ ", "      |  ___  |      ", "     /  /   \\  \\     "];
+    }
+
+    function drawPreviewCanvas(p) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, 320, 240);
+      const [mood, tag, l1, l2, alert] = getPreviewMood(p);
+      const blink = (p.animTick % 8) === 7;
+      ctx.font = "bold 9px Consolas, monospace";
+
+      // Top bar
+      ctx.strokeStyle = "#007a1f";
+      ctx.beginPath(); ctx.moveTo(0, 21); ctx.lineTo(320, 21); ctx.stroke();
+      ctx.fillStyle = "#00ff41";
+      ctx.fillText(p.screen === "TEMPERATURE" ? "LILYXM7 // TEMPERATURA" : p.screen === "CONNECTION_STATUS" ? "LILYXM7 // CONEXIÓN" : "LILYXM7 // VITARA 2.7", 6, 14);
+      if (p.isSimulated) {
+        ctx.fillStyle = "#00ff41"; ctx.fillRect(222, 3, 94, 15);
+        ctx.fillStyle = "#000"; ctx.fillText("SIMULACIÓN", 238, 14);
+      } else {
+        ctx.strokeStyle = p.hasLiveSignal ? "#00ff41" : "#007a1f"; ctx.strokeRect(228, 3, 88, 15);
+        ctx.fillStyle = p.hasLiveSignal ? "#00ff41" : "#00b82e"; ctx.fillText(p.hasLiveSignal ? "OBD-II CAN" : "SIN SEÑAL", 238, 14);
+      }
+
+      // Left panel (Lily ASCII)
+      ctx.strokeStyle = alert ? "#a8ffb8" : "#007a1f";
+      ctx.strokeRect(4, 26, 144, 156);
+      ctx.fillStyle = "#004d14";
+      ctx.fillText((p.animTick & 1) ? "01 10 LILY.ASCII 01" : "10 01 LILY.ASCII 10", 12, 36);
+      const art = getAscii(mood, blink);
+      ctx.font = "bold 8px Consolas, monospace";
+      art.forEach((line, i) => {
+        ctx.fillStyle = (i >= 3 && i <= 6) ? (alert ? "#a8ffb8" : "#00ff41") : (i === 9 ? "#00ff41" : "#00b82e");
+        ctx.fillText(line, 14, 48 + i * 9);
+      });
+      ctx.font = "bold 9px Consolas, monospace";
+      ctx.fillStyle = "#007a1f"; ctx.fillText("ESTADO:", 12, 175);
+      ctx.fillStyle = alert ? "#a8ffb8" : "#00ff41"; ctx.fillText(tag, 56, 175);
+
+      // Right panel
+      ctx.strokeStyle = (p.screen === "MAIN_MENU" || p.hasLiveSignal) ? "#007a1f" : "#a8ffb8";
+      ctx.strokeRect(154, 26, 162, 156);
+      if (p.screen === "MAIN_MENU") {
+        ctx.fillStyle = "#00ff41"; ctx.fillText("MENÚ PRINCIPAL", 164, 42);
+        ["Temperatura", "Estado de conexión"].forEach((lbl, idx) => {
+          const y = 62 + idx * 38;
+          if (idx === p.selectedIdx) {
+            ctx.fillStyle = "#00ff41"; ctx.fillRect(162, y, 146, 28);
+            ctx.fillStyle = "#000"; ctx.fillText("> " + lbl, 168, y + 17);
+          } else {
+            ctx.strokeStyle = "#007a1f"; ctx.strokeRect(162, y, 146, 28);
+            ctx.fillStyle = "#00b82e"; ctx.fillText("  " + lbl, 168, y + 17);
+          }
+        });
+      } else if (p.screen === "TEMPERATURE") {
+        ctx.fillStyle = "#00b82e"; ctx.fillText("REFRIGERANTE (01 05)", 162, 40);
+        if (p.hasLiveSignal) {
+          ctx.font = "bold 32px Consolas, monospace";
+          ctx.fillStyle = p.tempC > 107 ? "#a8ffb8" : "#00ff41";
+          ctx.fillText(`${p.tempC}°C`, 188, 92);
+          ctx.font = "bold 10px Consolas, monospace";
+          const tr = p.trend === "UP" ? `↑ Subió (+${p.deltaC}°C)` : p.trend === "DOWN" ? `↓ Bajó (${p.deltaC}°C)` : p.trend === "STABLE" ? "= Estable" : "* Lectura inicial";
+          ctx.fillText(tr, 166, 114);
+          ctx.strokeStyle = "#007a1f"; ctx.strokeRect(164, 128, 142, 14);
+          const pct = Math.max(0, Math.min(1, (p.tempC - 20) / 100));
+          ctx.fillStyle = p.tempC > 107 ? "#a8ffb8" : "#00ff41";
+          ctx.fillRect(166, 130, Math.round(pct * 138), 10);
+          ctx.fillStyle = "#007a1f"; ctx.fillText(`Lecturas OK: ${p.validCount}`, 164, 170);
+        } else {
+          ctx.fillStyle = "#003b00"; ctx.fillRect(162, 56, 146, 26);
+          ctx.strokeStyle = "#a8ffb8"; ctx.strokeRect(162, 56, 146, 26);
+          ctx.fillStyle = "#a8ffb8"; ctx.fillText("Sin datos del auto", 182, 72);
+          if (p.hasLastValue) {
+            ctx.fillStyle = "#00b82e"; ctx.fillText("Última lectura:", 166, 102);
+            ctx.font = "bold 24px Consolas, monospace";
+            ctx.fillStyle = "#007a1f"; ctx.fillText(`${p.tempC} °C`, 190, 132);
+          } else {
+            ctx.font = "bold 24px Consolas, monospace";
+            ctx.fillStyle = "#007a1f"; ctx.fillText("-- °C", 192, 124);
+          }
+        }
+      } else {
+        ctx.fillStyle = "#00ff41"; ctx.fillText("DIAGNÓSTICO ENLACE", 162, 40);
+        const rows = [
+          `Modo: ${p.isSimulated ? "SIMULACIÓN" : "OBD-II REAL"}`,
+          `ECU:  ${p.hasLiveSignal ? "CONECTADA" : "Sin datos"}`,
+          `Bus:  ${p.isSimulated ? "Virtual" : "CAN 500 kbps"}`,
+          "PID:  01 05 (Refrig.)",
+          `TX: ${p.txCount}  RX: ${p.validCount}`,
+          `Última: ${p.hasLastValue ? p.tempC + "°C (" + p.ageSec + "s)" : "ninguna"}`,
+        ];
+        rows.forEach((r, i) => {
+          ctx.fillStyle = i === 1 && !p.hasLiveSignal ? "#a8ffb8" : "#00b82e";
+          ctx.fillText(r, 162, 62 + i * 17);
+        });
+      }
+
+      // Dialogue box
+      ctx.font = "bold 9px Consolas, monospace";
+      ctx.strokeStyle = alert ? "#a8ffb8" : "#007a1f";
+      ctx.strokeRect(4, 186, 312, 36);
+      ctx.fillStyle = alert ? "#a8ffb8" : "#00ff41";
+      ctx.fillText(`> LILY: ${l1}`, 10, 200);
+      ctx.fillStyle = "#00b82e";
+      ctx.fillText(`  ${l2}`, 10, 214);
+
+      // Footer
+      ctx.fillStyle = "#007a1f";
+      ctx.fillText(p.screen === "MAIN_MENU" ? "[↑/↓] Mover   [A] Seleccionar" : "[B] Volver al menú principal", 8, 236);
+    }
+
+    async function refreshFrameAndState() {
+      try {
+        const stRes = await fetch("/api/state");
+        currentState = await stRes.json();
+
+        const badge = document.getElementById("engineBadge");
+        const banner = document.getElementById("previewBanner");
+        if (currentState.engine === "cpp") {
+          badge.textContent = "● MOTOR: C++ REAL (lilyxm7/*.cpp)";
+          badge.className = "badge cpp";
+          banner.style.display = "none";
+
+          const frRes = await fetch("/api/frame.rgb");
+          const buf = new Uint8Array(await frRes.arrayBuffer());
+          const dst = imgData.data;
+          for (let i = 0, j = 0; i < buf.length; i += 3, j += 4) {
+            dst[j] = buf[i];
+            dst[j + 1] = buf[i + 1];
+            dst[j + 2] = buf[i + 2];
+            dst[j + 3] = 255;
+          }
+          ctx.putImageData(imgData, 0, 0);
+        } else {
+          badge.textContent = "● MOTOR: PREVIEW (falta g++)";
+          badge.className = "badge preview";
+          banner.style.display = "block";
+          banner.innerHTML =
+            "<b>Modo Preview activo:</b> todavía no está instalado <code>g++</code> en Windows. " +
+            "Para compilar y ejecutar <b>tu código C++ real de <code>lilyxm7/*.cpp</code></b> pixel por pixel aquí mismo, " +
+            "ejecuta <code>ejecutar_simulador.bat</code> → opción <b>[4]</b> (instala WinLibs g++ automáticamente) y luego pulsa <b>Recompilar C++</b>.";
+          if (currentState.preview) drawPreviewCanvas(currentState.preview);
+        }
+
+        document.getElementById("modeSim").classList.toggle("selected", currentState.mode === "sim");
+        document.getElementById("modeObd").classList.toggle("selected", currentState.mode === "obd");
+        document.getElementById("modeBanner").textContent = currentState.mode === "sim" ? "MODO: SIMULACIÓN (POT)" : "MODO: OBD-II CAN VITARA";
+
+        signalOn = currentState.signalOn;
+        updateSignalButton();
+
+        const mask = currentState.gpioMask || 0;
+        document.getElementById("gpio2").classList.toggle("on", signalOn);
+        document.getElementById("gpio4").classList.toggle("on", (mask & (1 << 4)) !== 0);
+        document.getElementById("gpio5").classList.toggle("on", (mask & (1 << 5)) !== 0);
+        document.getElementById("gpio6").classList.toggle("on", (mask & (1 << 6)) !== 0);
+        document.getElementById("gpio7").classList.toggle("on", (mask & (1 << 7)) !== 0);
+        document.getElementById("gpio17").classList.toggle("on", currentState.mode === "obd");
+        document.getElementById("gpio18").classList.toggle("on", currentState.mode === "obd" && signalOn);
+
+        renderConsole();
+      } catch (e) {
+        document.getElementById("engineBadge").textContent = "SERVIDOR DESCONECTADO";
+      }
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp") { e.preventDefault(); pressBtn(4); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); pressBtn(5); }
+      else if (e.key === "a" || e.key === "A" || e.key === "Enter") { pressBtn(6); }
+      else if (e.key === "b" || e.key === "B" || e.key === "Escape") { pressBtn(7); }
+    });
+
+    setInterval(refreshFrameAndState, 110);
+    refreshFrameAndState();
+  </script>
+</body>
+</html>

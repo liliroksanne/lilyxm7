@@ -9,7 +9,12 @@ import socket
 import struct
 import sys
 import threading
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.run_logged import log_line
+
+LOG_COMPONENT = "mock_ecu_linux"
 CAN_FRAME_FMT = "=IB3x8s"
 OBD_REQ_ID = 0x7DF
 OBD_RESP_ID = 0x7E8
@@ -30,6 +35,7 @@ def main() -> int:
 
     print(f"[mock-ecu] Escuchando en {iface} (PID 01 05). Temp inicial: {state['temp_c']} °C")
     print("[mock-ecu] Comandos: escribe un número (ej. 95) para cambiar °C, 'off' para cortar señal, 'on' para reanudar, 'q' para salir.")
+    log_line(LOG_COMPONENT, f"Mock ECU iniciado en {iface}, temp_inicial={state['temp_c']}C")
 
     def input_loop() -> None:
         while state["running"]:
@@ -44,15 +50,18 @@ def main() -> int:
             elif cmd == "off":
                 state["silent"] = True
                 print("[mock-ecu] Señal cortada (la ECU no responderá).")
+                log_line(LOG_COMPONENT, "Senal cortada manualmente (modo silent)", level="WARN")
             elif cmd == "on":
                 state["silent"] = False
                 print(f"[mock-ecu] Señal activa ({state['temp_c']} °C).")
+                log_line(LOG_COMPONENT, f"Senal reanudada ({state['temp_c']}C)")
             else:
                 try:
                     val = int(cmd)
                     state["temp_c"] = max(-40, min(215, val))
                     state["silent"] = False
                     print(f"[mock-ecu] Temperatura actualizada a {state['temp_c']} °C (byte A=0x{encode_temp(state['temp_c']):02X}).")
+                    log_line(LOG_COMPONENT, f"Temperatura cambiada a {state['temp_c']}C (byteA=0x{encode_temp(state['temp_c']):02X})")
                 except ValueError:
                     print("[mock-ecu] Comando no reconocido. Usa un entero (-40..215), 'off', 'on' o 'q'.")
 

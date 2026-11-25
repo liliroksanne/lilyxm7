@@ -10,6 +10,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -19,6 +21,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -29,6 +32,21 @@ void onSignal(int) {
   g_running = 0;
 }
 
+void logToCentralFiles(const char* level, const std::string& msg) {
+  ::mkdir("../logs", 0755);
+  std::time_t now = std::time(nullptr);
+  char ts[32];
+  std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+  const std::string line = std::string("[") + ts + "][ecu_tester_linux][" + level + "] " + msg + "\n";
+
+  for (const char* path : { "../logs/ecu_tester_linux.log", "../logs/all.log" }) {
+    std::ofstream out(path, std::ios::app);
+    if (out.is_open()) {
+      out << line;
+    }
+  }
+}
+
 uint32_t nowMs() {
   using namespace std::chrono;
   static const auto t0 = steady_clock::now();
@@ -37,11 +55,11 @@ uint32_t nowMs() {
 
 const char* trendToText(TempTrend trend) {
   switch (trend) {
-    case TempTrend::RISING:  return "SUBIÓ";
-    case TempTrend::FALLING: return "BAJÓ";
-    case TempTrend::STABLE:  return "ESTABLE";
-    case TempTrend::NONE:
-    default:                 return "INICIAL";
+    case TempTrend::TREND_UP:     return "SUBIÓ";
+    case TempTrend::TREND_DOWN:   return "BAJÓ";
+    case TempTrend::TREND_STABLE: return "ESTABLE";
+    case TempTrend::TREND_NONE:
+    default:                      return "INICIAL";
   }
 }
 
@@ -82,8 +100,10 @@ int main(int argc, char* argv[]) {
   std::cout << "========================================================\n";
   std::cout << " lilyxm7 OBD-II Linux Tester (Servicio 01, PID 05)\n";
   std::cout << " Interfaz SocketCAN: " << iface << "\n";
+  std::cout << " Log centralizado: ../logs/ecu_tester_linux.log\n";
   std::cout << " Presiona Ctrl+C para salir.\n";
   std::cout << "========================================================\n";
+  logToCentralFiles("INFO", "Tester iniciado en interfaz " + iface);
 
   obd::TempTracker tracker(false, 1);
   uint32_t lastTxMs = 0;
@@ -125,9 +145,13 @@ int main(int argc, char* argv[]) {
           tracker.recordValidReading(tempC, nowMs());
           const TempReading& r = tracker.reading();
           lastReportedNoSignal = false;
-          std::printf("[OK] ID=0x%03X -> Refrigerante: %d °C | Tendencia: %s (delta %+d °C) | Lecturas: %u\n",
-                      frame.id, r.tempC, trendToText(r.trend), r.deltaC, r.validCount);
+          char msgBuf[160];
+          std::snprintf(msgBuf, sizeof(msgBuf),
+                        "ID=0x%03X -> Refrigerante: %d °C | Tendencia: %s (delta %+d °C) | Lecturas: %u",
+                        frame.id, r.tempC, trendToText(r.trend), r.deltaC, r.validCount);
+          std::printf("[OK] %s\n", msgBuf);
           std::fflush(stdout);
+          logToCentralFiles("INFO", msgBuf);
         }
       }
     }
@@ -137,16 +161,20 @@ int main(int argc, char* argv[]) {
     const TempReading& r = tracker.reading();
     if (!r.hasLiveSignal && !lastReportedNoSignal && now >= timeoutMs) {
       lastReportedNoSignal = true;
+      char alertBuf[128];
       if (r.hasLastValue) {
-        std::printf("[ALERTA] Sin datos del auto | Última lectura: %d °C\n", r.tempC);
+        std::snprintf(alertBuf, sizeof(alertBuf), "Sin datos del auto | Última lectura: %d °C", r.tempC);
       } else {
-        std::printf("[ALERTA] Sin datos del auto | Sin lecturas previas\n");
+        std::snprintf(alertBuf, sizeof(alertBuf), "Sin datos del auto | Sin lecturas previas");
       }
+      std::printf("[ALERTA] %s\n", alertBuf);
       std::fflush(stdout);
+      logToCentralFiles("WARN", alertBuf);
     }
   }
 
   ::close(sock);
+  logToCentralFiles("INFO", "Prueba finalizada.");
   std::cout << "\n[lilyxm7] Prueba finalizada.\n";
   return 0;
 }
