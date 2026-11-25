@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "author": "lilyxm7",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": { "flashSize": "16" }
+    },
+    {
+      "type": "wokwi-ili9341",
+      "id": "lcd1",
+      "top": -110,
+      "left": 210,
+      "rotate": 270,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot_temp",
+      "top": -90,
+      "left": -170,
+      "attrs": { "label": "Temp °C (20..120)" }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "sw_signal",
+      "top": 15,
+      "left": -155,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_up",
+      "top": 110,
+      "left": -190,
+      "attrs": { "color": "green", "label": "UP", "key": "ArrowUp" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_down",
+      "top": 180,
+      "left": -190,
+      "attrs": { "color": "green", "label": "DOWN", "key": "ArrowDown" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_a",
+      "top": 110,
+      "left": -100,
+      "attrs": { "color": "blue", "label": "A", "key": "a" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_b",
+      "top": 180,
+      "left": -100,
+      "attrs": { "color": "red", "label": "B", "key": "b" }
+    }
+  ],
+  "connections": [
+    [ "lcd1:VCC",  "esp:3V3.1", "red",    [ "v0" ] ],
+    [ "lcd1:LED",  "esp:3V3.2", "orange", [ "v0" ] ],
+    [ "lcd1:GND",  "esp:GND.1", "black",  [ "v0" ] ],
+    [ "lcd1:CS",   "esp:10",    "yellow", [ "v0" ] ],
+    [ "lcd1:D/C",  "esp:9",     "blue",   [ "v0" ] ],
+    [ "lcd1:RST",  "esp:14",    "white",  [ "v0" ] ],
+    [ "lcd1:MOSI", "esp:11",    "purple", [ "v0" ] ],
+    [ "lcd1:SCK",  "esp:12",    "green",  [ "v0" ] ],
+    [ "lcd1:MISO", "esp:13",    "gray",   [ "v0" ] ],
+
+    [ "pot_temp:VCC", "esp:3V3.1", "red",   [ "v0" ] ],
+    [ "pot_temp:GND", "esp:GND.2", "black", [ "v0" ] ],
+    [ "pot_temp:SIG", "esp:1",     "cyan",  [ "v0" ] ],
+
+    [ "sw_signal:1", "esp:GND.2", "black",  [ "v0" ] ],
+    [ "sw_signal:2", "esp:2",     "orange", [ "v0" ] ],
+
+    [ "btn_up:1.r",   "esp:GND.3", "black",  [ "h0" ] ],
+    [ "btn_up:2.r",   "esp:4",     "green",  [ "h0" ] ],
+    [ "btn_down:1.r", "esp:GND.3", "black",  [ "h0" ] ],
+    [ "btn_down:2.r", "esp:5",     "green",  [ "h0" ] ],
+    [ "btn_a:1.r",    "esp:GND.3", "black",  [ "h0" ] ],
+    [ "btn_a:2.r",    "esp:6",     "blue",   [ "h0" ] ],
+    [ "btn_b:1.r",    "esp:GND.3", "black",  [ "h0" ] ],
+    [ "btn_b:2.r",    "esp:7",     "red",    [ "h0" ] ]
+  ],
+  "dependencies": {}
+}

@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "build/lilyxm7.ino.merged.bin"
+elf = "build/lilyxm7.ino.elf"

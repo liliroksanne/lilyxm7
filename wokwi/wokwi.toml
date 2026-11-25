@@ -1,0 +1,6 @@
+[wokwi]
+version = 1
+# Si usas la extensión oficial de Wokwi para VS Code con Arduino CLI / PlatformIO,
+# apunta firmware y elf al binario compilado de lilyxm7.
+firmware = "../build/lilyxm7.ino.merged.bin"
+elf = "../build/lilyxm7.ino.elf"

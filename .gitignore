@@ -1,0 +1,17 @@
+# Compilaciones y artefactos locales
+build/
+build_real/
+*.bin
+*.elf
+*.o
+ecu_sim_linux/lilyxm7_obd_tester
+ecu_sim_linux/test_obd_protocol
+tests/test_obd_protocol
+tests/test_obd_protocol.exe
+
+# Python / OS / IDE
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode/
