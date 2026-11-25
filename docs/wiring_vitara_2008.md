@@ -54,6 +54,23 @@ La Suzuki Grand Vitara 2008 V6 2.7 L (motor N27A, serie JT) utiliza **ISO 15765-
 2. **Ignición en ON:** la ECU no responde con el switch apagado. Pon la llave en **ON** o arranca el motor para ver lecturas reales en °C.
 3. **Verificación de pérdida de señal:** una vez veas la temperatura real en °C, apaga la ignición o desconecta la extensión en Y; en 3 segundos debe aparecer **«Sin datos del auto»** junto a la **«Última lectura»**.
 
-## 3. Componentes reservados para versiones futuras
+### LED «Ojo de Lily»
+
+Conecta **GPIO 16 → resistencia de 330 Ω → ánodo (+)** del LED indicador. Conecta el cátodo (−) a **GND** de la ESP32. Elige un LED indicador de baja tensión directa compatible con 3.3 V. El firmware lo enciende durante 450 ms por mensaje y 1.1 s por alerta.
+
+## 3. Relés y ventiladores de la Vitara
+
+El simulador reproduce los trayectos del [esquema de enfriamiento de la Grand Vitara 2008 V6 2.7 L 2WD](https://charm.li/Suzuki/2008/Grand%20Vitara%202WD%20V6-2.7L/Repair%20and%20Diagnosis/Diagrams/Electrical%20Diagrams/Cooling%20System/). Confirma la variante del vehículo antes de usar las referencias E29, E30 y E31.
+
+| Modo | Relés cerrados o conmutados | Trayecto de potencia |
+|---|---|---|
+| Ambos en baja | 1 (E29) | Batería + → RDTR2 → E29 → ventilador 1 → contacto de reposo de E31 → ventilador 2 → masa |
+| Alta del ventilador 1 | 1 (E29) y 3 (E31) | Batería + → RDTR2 → E29 → ventilador 1 → E31 conmutado → masa |
+| Alta del ventilador 2 | 2 (E30) | Batería + → RDTR → E30 → ventilador 2 → masa |
+| Ambos en alta | 1, 2 y 3 | Cada motor recibe su propia alimentación protegida |
+
+En el vehículo, la ECM controla las bobinas y conserva el mando del circuito de enfriamiento. Los controles manuales del simulador actúan sobre la ECU virtual. La conexión física del escáner al vehículo sigue siendo el enlace OBD-II de la sección 2. El pin 16 del OBD-II se deja libre al alimentar la ESP32 por USB.
+
+## 4. Componentes reservados para versiones futuras
 - **Bocina del kit LAFVIN**: reservada para avisos sonoros / de voz en versiones posteriores.
 - **ULN2003AN**: reservado para pruebas de relevadores en banco en una etapa posterior (no conectar en v1.0).

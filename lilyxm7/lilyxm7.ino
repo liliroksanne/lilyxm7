@@ -67,6 +67,8 @@ void handleButtonEvent(ButtonEvent ev) {
 } // namespace
 
 void setup() {
+  g_currentScreen = ScreenId::MAIN_MENU;
+  g_selectedOption = MenuOption::TEMPERATURE;
   Serial.begin(115200);
   delay(200);
   Serial.println(F("========================================"));

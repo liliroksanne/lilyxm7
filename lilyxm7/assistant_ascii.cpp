@@ -9,6 +9,8 @@ namespace {
 ChatMessage g_chatHistory[CHAT_MAX_MESSAGES];
 uint8_t g_chatCount = 0;
 uint32_t g_chatVersion = 0;
+uint32_t g_eyeStartedMs = 0;
+uint32_t g_eyeDurationMs = 0;
 
 bool g_hasInitialized = false;
 ScreenId g_prevScreen = ScreenId::MAIN_MENU;
@@ -40,6 +42,9 @@ void pushChatMessage(const char* msg, bool isAlert) {
   }
 
   g_chatVersion++;
+  g_eyeStartedMs = millis();
+  g_eyeDurationMs = isAlert ? 1100 : 450;
+  digitalWrite(PIN_LILY_EYE, HIGH);
   Serial.printf("[LOG][CHAT] LILY: %s\n", msg);
 }
 
@@ -107,23 +112,31 @@ void formatTrendNote(const TempReading& reading, char* buf, size_t len) {
 void assistantChatInit(bool isSimulated) {
   g_chatCount = 0;
   g_chatVersion = 0;
+  g_eyeDurationMs = 0;
+  pinMode(PIN_LILY_EYE, OUTPUT);
+  digitalWrite(PIN_LILY_EYE, LOW);
   g_hasInitialized = true;
   g_prevScreen = ScreenId::MAIN_MENU;
   g_prevMood = AssistantMood::MENU_IDLE;
   g_prevLiveSignal = false;
   g_lastAnnouncedTemp = -999;
 
-  pushChatMessage("Hola! Soy Lily v1.0.", false);
+  pushChatMessage("Cobro en amperios.", false);
   if (isSimulated) {
     pushChatMessage("Modo SIMULACIÓN activo.", false);
   } else {
-    pushChatMessage("Lista p/ Vitara 2.7L.", false);
+    pushChatMessage("Vitara lista. ¿Tú?", false);
   }
 }
 
 AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) {
   if (!g_hasInitialized) {
     assistantChatInit(reading.isSimulated);
+  }
+
+  if (g_eyeDurationMs && millis() - g_eyeStartedMs >= g_eyeDurationMs) {
+    g_eyeDurationMs = 0;
+    digitalWrite(PIN_LILY_EYE, LOW);
   }
 
   AssistantState st{};
@@ -135,9 +148,9 @@ AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) 
 
   if (screenChanged) {
     if (screen == ScreenId::TEMPERATURE) {
-      pushChatMessage("Abriendo Temperatura...", false);
+      pushChatMessage("¿Quién tiene calor?", false);
     } else if (screen == ScreenId::CONNECTION_STATUS) {
-      pushChatMessage("Revisando enlace ECU.", false);
+      pushChatMessage("ECU, ¿me copias?", false);
     } else {
       pushChatMessage("Menú principal listo.", false);
     }
@@ -167,15 +180,15 @@ AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) 
     if (recovered || moodChanged || bigStep) {
       char msg[CHAT_MSG_MAX_LEN];
       if (recovered && g_lastAnnouncedTemp != -999) {
-        snprintf(msg, sizeof(msg), "Señal OK! Ahora %d°C", reading.tempC);
+        snprintf(msg, sizeof(msg), "Volvió la ECU: %d°C.", reading.tempC);
         pushChatMessage(msg, false);
       } else {
         switch (tempMood) {
           case AssistantMood::COLD:
             if (reading.trend == TempTrend::TREND_UP) {
-              snprintf(msg, sizeof(msg), "Subió a %d°C, calent.", reading.tempC);
+              snprintf(msg, sizeof(msg), "%d°C. Sin suéter.", reading.tempC);
             } else {
-              snprintf(msg, sizeof(msg), "Motor frío: %d°C.", reading.tempC);
+              snprintf(msg, sizeof(msg), "%d°C. Pide cobija.", reading.tempC);
             }
             pushChatMessage(msg, false);
             break;
@@ -193,7 +206,7 @@ AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) 
 
           case AssistantMood::OPTIMAL:
             if (moodChanged) {
-              snprintf(msg, sizeof(msg), "%d°C! Temp óptima :)", reading.tempC);
+              snprintf(msg, sizeof(msg), "%d°C. Ni sopa :)", reading.tempC);
             } else if (reading.trend == TempTrend::TREND_UP) {
               snprintf(msg, sizeof(msg), "Subió a %d°C (ideal).", reading.tempC);
             } else {

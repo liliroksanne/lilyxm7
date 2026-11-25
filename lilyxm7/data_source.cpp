@@ -111,8 +111,6 @@ bool startTwaiDriver() {
 
 void initObdRealSource() {
   g_tracker.reset(false);
-  g_txRequests = 0;
-  g_txErrors = 0;
   g_lastPollMs = 0;
   g_busState = startTwaiDriver() ? BusHardwareState::RUNNING : BusHardwareState::INIT_ERROR;
 }
@@ -208,6 +206,10 @@ void updateObdRealSource(uint32_t nowMs) {
 } // namespace
 
 void dataSourceInit() {
+  g_lastLoggedLive = false;
+  g_lastLoggedTemp = -999;
+  g_txRequests = 0;
+  g_txErrors = 0;
 #if LILYXM7_SIMULATION_MODE
   initSimulationSource();
 #else

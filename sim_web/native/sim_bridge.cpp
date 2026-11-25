@@ -120,7 +120,7 @@ namespace {
 twai_state_t g_state = TWAI_STATE_STOPPED;
 int g_ecuTempC = 86;
 bool g_ecuOnline = true;
-int g_recoverTicks = 0;
+uint32_t g_recoveryStartedMs = 0;
 std::deque<twai_message_t> g_rxQueue;
 std::mutex g_canMtx;
 std::string g_canLog;
@@ -157,6 +157,7 @@ int popCanLog(char* outBuf, int maxLen) {
 
 esp_err_t twai_driver_install(const twai_general_config_t*, const twai_timing_config_t*, const twai_filter_config_t*) {
   sim_can::g_state = TWAI_STATE_STOPPED;
+  sim_can::g_rxQueue.clear();
   sim_can::appendCanLog("[BUS] TWAI instalado a 500 kbps (ISO 15765-4 Vitara 2008)");
   return ESP_OK;
 }
@@ -219,12 +220,10 @@ esp_err_t twai_receive(twai_message_t* msg, TickType_t) {
 
 esp_err_t twai_get_status_info(twai_status_info_t* status) {
   if (!status) return ESP_FAIL;
-  if (sim_can::g_state == TWAI_STATE_RECOVERING) {
-    sim_can::g_recoverTicks++;
-    if (sim_can::g_recoverTicks >= 15) {
-      sim_can::g_state = TWAI_STATE_STOPPED;
-      sim_can::g_recoverTicks = 0;
-    }
+  // A fixed virtual idle interval models completion without depending on the polling rate.
+  if (sim_can::g_state == TWAI_STATE_RECOVERING &&
+      millis() - sim_can::g_recoveryStartedMs >= 600) {
+    sim_can::g_state = TWAI_STATE_STOPPED;
   }
   status->state = sim_can::g_state;
   return ESP_OK;
@@ -232,7 +231,7 @@ esp_err_t twai_get_status_info(twai_status_info_t* status) {
 
 esp_err_t twai_initiate_recovery() {
   sim_can::g_state = TWAI_STATE_RECOVERING;
-  sim_can::g_recoverTicks = 0;
+  sim_can::g_recoveryStartedMs = millis();
   sim_can::appendCanLog("[BUS] Iniciando recuperacion de BUS_OFF...");
   return ESP_OK;
 }
@@ -287,11 +286,14 @@ SIM_EXPORT void sim_set_button(int pin, int pressed) {
 }
 
 SIM_EXPORT void sim_set_temp_c(int temp_c) {
+  const int ecu_temp_c = temp_c;
   if (temp_c < SIM_TEMP_MIN_C) temp_c = SIM_TEMP_MIN_C;
   if (temp_c > SIM_TEMP_MAX_C) temp_c = SIM_TEMP_MAX_C;
-  int adc = static_cast<int>(map(temp_c, SIM_TEMP_MIN_C, SIM_TEMP_MAX_C, 0, 4095));
+  // Round up to the first ADC sample the firmware decodes as this integer.
+  constexpr int span = SIM_TEMP_MAX_C - SIM_TEMP_MIN_C;
+  int adc = ((temp_c - SIM_TEMP_MIN_C) * 4095 + span - 1) / span;
   sim_hw::setAnalogInput(PIN_SIM_POT, adc);
-  sim_can::setEcuTemp(temp_c);
+  sim_can::setEcuTemp(ecu_temp_c);
 }
 
 SIM_EXPORT void sim_set_signal(int enabled) {
@@ -331,4 +333,8 @@ SIM_EXPORT int sim_pop_can_log(char* out_buf, int max_len) {
 
 SIM_EXPORT uint32_t sim_get_gpio_mask() {
   return sim_hw::getActiveGpioMask();
+}
+
+SIM_EXPORT int sim_get_eye() {
+  return digitalRead(PIN_LILY_EYE) == HIGH;
 }

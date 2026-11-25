@@ -37,6 +37,9 @@ constexpr int PIN_BTN_DOWN = 5;  // Flecha abajo (↓)
 constexpr int PIN_BTN_A    = 6;  // Botón A (Seleccionar)
 constexpr int PIN_BTN_B    = 7;  // Botón B (Volver)
 
+// LED indicador de actividad de Lily (activo HIGH, con resistencia serie).
+constexpr int PIN_LILY_EYE = 16;
+
 // Entradas de simulación para Wokwi (solo activas cuando LILYXM7_SIMULATION_MODE == 1)
 constexpr int PIN_SIM_POT        = 1; // Potenciómetro de temperatura (ADC1_CH0)
 constexpr int PIN_SIM_SIGNAL_SW  = 2; // Switch de señal: LOW = ECU responde, HIGH = sin señal

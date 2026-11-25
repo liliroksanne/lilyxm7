@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +43,15 @@ LOG_COMPONENT = "sim_web"
 HOST = "127.0.0.1"
 PORT = 8765
 
+# Parse the literal GPIO constants used by the firmware, including in preview mode.
+PIN_CONFIG = PROJECT_ROOT / "lilyxm7" / "config.h"
+PIN_PATTERN = re.compile(r"^constexpr\s+int\s+(PIN_\w+)\s*=\s*(\d+)\s*;", re.MULTILINE)
+
+
+def read_pins() -> dict[str, int]:
+    return {name: int(number) for name, number in PIN_PATTERN.findall(PIN_CONFIG.read_text(encoding="utf-8"))}
+
+
 SERIAL_TAG_RE = re.compile(r"^\[LOG\]\[([A-Z0-9_]+)\]\s*(.*)$")
 
 
@@ -53,6 +63,7 @@ def find_cpp_compiler() -> str | None:
             return found
 
     candidates: list[Path] = [
+        BUILD_DIR / "w64devkit" / "bin" / "g++.exe",
         Path(r"C:\msys64\ucrt64\bin\g++.exe"),
         Path(r"C:\msys64\mingw64\bin\g++.exe"),
         Path(r"C:\mingw64\bin\g++.exe"),
@@ -92,14 +103,18 @@ class VitaraEngineSim:
         self.profile = "idle"
         self.obd_connected = True
         self.auto_thermal = True
-        self.fan_on = False
+        self.relay_mode = "auto"
+        self.relay_low = False
+        self.relay_high = (False, False)
         self.thermostat_open = False
         self._last_ts = time.monotonic()
         self._last_logged_int = 28
 
     def reset_cold(self) -> None:
         self.coolant_c = 28.0
-        self.fan_on = False
+        self.relay_mode = "auto"
+        self.relay_low = False
+        self.relay_high = (False, False)
         self.thermostat_open = False
         self._last_logged_int = 28
 
@@ -114,40 +129,54 @@ class VitaraEngineSim:
         self._last_ts = now
         events: list[tuple[str, str]] = []
 
-        if not self.auto_thermal:
-            return events
-
-        if self.ignition == "RUNNING":
-            prof = self.PROFILES.get(self.profile, self.PROFILES["idle"])
-            target = prof["target"]
-            rate = prof["rate"]
-            if self.coolant_c < target:
-                # Calentamiento progresivo (mas rapido al inicio, mas suave cerca del termostato)
-                factor = 1.0 if (target - self.coolant_c) > 10.0 else 0.45
-                self.coolant_c = min(target, self.coolant_c + rate * factor * dt_s)
-            elif self.coolant_c > target:
-                self.coolant_c = max(target, self.coolant_c - 1.4 * dt_s)
-        else:
-            # Motor apagado -> enfriamiento gradual hacia temperatura ambiente
-            if self.coolant_c > self.ambient_c:
-                self.coolant_c = max(self.ambient_c, self.coolant_c - 1.2 * dt_s)
-
-        # Histéresis del termostato (~82 °C) y electroventilador (~95 °C, salvo en falla)
-        if not self.thermostat_open and self.coolant_c >= 82.0:
+        # The thermostat fault models a valve stuck closed; the fans can still spin.
+        if self.profile == "fault":
+            self.thermostat_open = False
+        elif self.coolant_c >= 82.0 and not self.thermostat_open:
             self.thermostat_open = True
-            events.append(("INFO", "Termostato abierto (~82 °C), regulando flujo de refrigerante"))
-        elif self.thermostat_open and self.coolant_c <= 76.0:
+            events.append(("INFO", "Termostato abierto (~82 °C)"))
+        elif self.coolant_c <= 76.0:
             self.thermostat_open = False
 
-        if self.profile != "fault":
-            if not self.fan_on and self.coolant_c >= 94.0:
-                self.fan_on = True
-                events.append(("INFO", "Electroventilador ENCENDIDO (>= 94 °C)"))
-            elif self.fan_on and self.coolant_c <= 89.0:
-                self.fan_on = False
-                events.append(("INFO", "Electroventilador APAGADO (<= 89 °C)"))
+        before = self.relay_states()
+        if self.ignition == "OFF":
+            self.relay_low = False
+            self.relay_high = (False, False)
+        elif self.relay_mode == "auto":
+            self.relay_low = self.coolant_c >= (92 if self.relay_low else 95)
+            self.relay_high = (
+                self.coolant_c >= (97 if self.relay_high[0] else 100),
+                self.coolant_c >= (102 if self.relay_high[1] else 105),
+            )
         else:
-            self.fan_on = False
+            self.relay_low = self.relay_mode == "low"
+            self.relay_high = (
+                self.relay_mode in ("high1", "both"),
+                self.relay_mode in ("high2", "both"),
+            )
+
+        for label, was_on, is_on in zip(
+            ("N.º 1 · alimentación", "N.º 3 · conmutación", "N.º 2 · alta ventilador 2"),
+            before, self.relay_states(),
+        ):
+            if was_on != is_on:
+                events.append(("INFO", f"Relé {label}: {'ACTIVO' if is_on else 'ABIERTO'}"))
+
+        if self.auto_thermal:
+            if self.ignition == "RUNNING":
+                profile = self.PROFILES[self.profile]
+                gap = profile["target"] - self.coolant_c
+                if gap > 0:
+                    rate = profile["rate"] * (1.0 if gap > 10.0 else 0.45)
+                    natural = self.coolant_c + min(gap, rate * dt_s)
+                else:
+                    natural = self.coolant_c + max(gap, -1.4 * dt_s)
+            else:
+                natural = max(self.ambient_c, self.coolant_c - 1.2 * dt_s)
+            airflow = sum({"off": 0.0, "low": 0.85, "high": 2.3}[speed] for speed in self.fan_speeds())
+            # Below the thermostat threshold the radiator has little effect on coolant.
+            circulation = 1.0 if self.thermostat_open else 0.12
+            self.coolant_c = max(self.ambient_c, natural - airflow * circulation * dt_s)
 
         cur_int = int(round(self.coolant_c))
         if abs(cur_int - self._last_logged_int) >= 5:
@@ -155,6 +184,18 @@ class VitaraEngineSim:
             events.append(("INFO", f"Motor Vitara 2.7L -> refrigerante={self.coolant_c:.1f} °C ({self.ignition}/{self.profile})"))
 
         return events
+
+    def relay_states(self) -> tuple[bool, bool, bool]:
+        high1, high2 = self.relay_high
+        return self.relay_low or high1, high1, high2  # OEM: relays 1, 3, 2
+
+    def fan_speeds(self) -> tuple[str, str]:
+        feed1, changeover, feed2 = self.relay_states()
+        in_series = feed1 and not changeover and not feed2
+        return (
+            "high" if feed1 and changeover else "low" if in_series else "off",
+            "high" if feed2 else "low" if in_series else "off",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         prof = self.PROFILES.get(self.profile, self.PROFILES["idle"])
@@ -169,7 +210,10 @@ class VitaraEngineSim:
             "autoThermal": self.auto_thermal,
             "ecuResponding": self.is_ecu_responding(),
             "thermostatOpen": self.thermostat_open,
-            "fanOn": self.fan_on,
+            "fanOn": any(speed != "off" for speed in self.fan_speeds()),
+            "fanSpeeds": self.fan_speeds(),
+            "relayMode": self.relay_mode,
+            "relays": dict(zip(("r1", "r3", "r2"), self.relay_states())),
         }
 
 
@@ -193,6 +237,8 @@ class NativeDllWrapper:
         self.lib.sim_pop_can_log.restype = ctypes.c_int
         self.lib.sim_get_gpio_mask.argtypes = []
         self.lib.sim_get_gpio_mask.restype = ctypes.c_uint32
+        self.lib.sim_get_eye.argtypes = []
+        self.lib.sim_get_eye.restype = ctypes.c_int
 
         self._fb_buf = (ctypes.c_uint8 * (320 * 240 * 3))()
         self._text_buf = ctypes.create_string_buffer(8192)
@@ -231,6 +277,9 @@ class NativeDllWrapper:
             return ""
         return self._text_buf.raw[:n].decode("utf-8", errors="replace")
 
+    def is_eye_on(self) -> bool:
+        return bool(self.lib.sim_get_eye())
+
     def get_gpio_mask(self) -> int:
         return int(self.lib.sim_get_gpio_mask())
 
@@ -263,13 +312,15 @@ class PreviewFallbackEngine:
         self.prev_mood = "MENU_IDLE"
         self.last_announced_temp = -999
         self.chat_messages: list[dict[str, Any]] = []
-        self._push_chat("Hola! Soy Lily v1.0.", False)
-        self._push_chat("Modo SIMULACIÓN activo." if mode == "sim" else "Lista p/ Vitara 2.7L.", False)
+        self.eye_until = 0.0
+        self._push_chat("Cobro en amperios.", False)
+        self._push_chat("Modo SIMULACIÓN activo." if mode == "sim" else "Vitara lista. ¿Tú?", False)
 
     def _push_chat(self, text: str, is_alert: bool) -> None:
         if self.chat_messages and self.chat_messages[-1]["text"] == text:
             return
         ts = dt.datetime.now().strftime("%H:%M:%S")
+        self.eye_until = time.monotonic() + (1.1 if is_alert else 0.45)
         self.chat_messages.append({"ts": ts, "text": text, "isAlert": is_alert})
         if len(self.chat_messages) > 25:
             self.chat_messages = self.chat_messages[-25:]
@@ -288,21 +339,21 @@ class PreviewFallbackEngine:
             return ("WARM_WARN", "TEMP ALTA", True)
         return ("OVERHEAT", "PELIGRO!", True)
 
-    def press_button(self, pin: int) -> None:
-        names = {4: "UP", 5: "DOWN", 6: "A", 7: "B"}
+    def press_button(self, pin: int, pins: dict[str, int]) -> None:
+        names = {pins["PIN_BTN_UP"]: "UP", pins["PIN_BTN_DOWN"]: "DOWN", pins["PIN_BTN_A"]: "A", pins["PIN_BTN_B"]: "B"}
         self._emit("BTN", "INFO", f"Pulsado {names.get(pin, pin)} (GPIO {pin})")
         if self.screen == "MAIN_MENU":
-            if pin == 4:
+            if pin == pins["PIN_BTN_UP"]:
                 self.selected_idx = (self.selected_idx - 1) % 2
                 self._emit("UI", "INFO", f"Cursor menú -> {'Temperatura' if self.selected_idx == 0 else 'Estado de conexión'}")
-            elif pin == 5:
+            elif pin == pins["PIN_BTN_DOWN"]:
                 self.selected_idx = (self.selected_idx + 1) % 2
                 self._emit("UI", "INFO", f"Cursor menú -> {'Temperatura' if self.selected_idx == 0 else 'Estado de conexión'}")
-            elif pin == 6:
+            elif pin == pins["PIN_BTN_A"]:
                 self.screen = "TEMPERATURE" if self.selected_idx == 0 else "CONNECTION_STATUS"
                 self._emit("UI", "INFO", f"Cambio de pantalla -> {self.screen}")
-                self._push_chat("Abriendo Temperatura..." if self.screen == "TEMPERATURE" else "Revisando enlace ECU.", False)
-        elif pin == 7:
+                self._push_chat("¿Quién tiene calor?" if self.screen == "TEMPERATURE" else "Revisando enlace ECU.", False)
+        elif pin == pins["PIN_BTN_B"]:
             self.screen = "MAIN_MENU"
             self._emit("UI", "INFO", "Regreso a pantalla -> MAIN_MENU")
             self._push_chat("Menú principal listo.", False)
@@ -359,7 +410,7 @@ class PreviewFallbackEngine:
                         self._push_chat(f"Calentando: {self.last_temp}°C (+)" if self.trend == "UP" else f"Tomando temp: {self.last_temp}°C.", False)
                     elif mood == "OPTIMAL":
                         if mood_changed:
-                            self._push_chat(f"{self.last_temp}°C! Temp óptima :)", False)
+                            self._push_chat(f"{self.last_temp}°C. Ni sopa :)", False)
                         elif self.trend == "UP":
                             self._push_chat(f"Subió a {self.last_temp}°C (ideal).", False)
                         else:
@@ -413,6 +464,11 @@ class SimManager:
         self.dll: NativeDllWrapper | None = None
         self.dll_paths: dict[str, Path] = {}
         self.dll_generation = 0
+        self.pins = read_pins()
+        self.button_queue: deque[int] = deque()
+        self.pressed_pin: int | None = None
+        self.next_button_ms = 0
+        self.last_tick_ms = 0
         self.frame_bytes: bytes = bytes(320 * 240 * 3)
         self.gpio_mask: int = 0
         self.log_seq = 0
@@ -478,23 +534,20 @@ class SimManager:
         with self.lock:
             self.compiler = find_cpp_compiler()
             self.build_error = None
+            pins = read_pins()
 
             if not self.compiler:
                 msg = "No se encontro g++/clang++ en Windows. Usando motor PREVIEW (instala g++ con opcion [4] para C++ real)."
                 self.emit_log("BUILD", "WARN", msg)
-                self.dll = None
-                self._load_mode_locked(self.mode)
+                self.build_error = msg
+                if self.dll is None:
+                    self.pins = pins
+                    self._load_mode_locked(self.mode)
                 return False, msg
 
             BUILD_DIR.mkdir(parents=True, exist_ok=True)
             self.dll_generation += 1
             gen = self.dll_generation
-
-            for old in BUILD_DIR.glob("lilyxm7_*.dll"):
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
 
             compiler_dir = str(Path(self.compiler).parent)
             if hasattr(os, "add_dll_directory"):
@@ -504,10 +557,11 @@ class SimManager:
                     pass
 
             targets = [
-                ("sim", 1, BUILD_DIR / f"lilyxm7_sim_{gen}.dll"),
-                ("obd", 0, BUILD_DIR / f"lilyxm7_obd_{gen}.dll"),
+                ("sim", 1, BUILD_DIR / f"lilyxm7_sim_{os.getpid()}_{gen}.dll"),
+                ("obd", 0, BUILD_DIR / f"lilyxm7_obd_{os.getpid()}_{gen}.dll"),
             ]
 
+            new_paths = {}
             for key, sim_flag, out_dll in targets:
                 cmd = [
                     self.compiler,
@@ -532,9 +586,21 @@ class SimManager:
                     err_msg = f"Error compilando modo {key} (exit={res.returncode})"
                     self.build_error = err_msg
                     self.emit_log("BUILD", "ERROR", err_msg)
-                    self.dll = None
+                    if self.dll is None:
+                        self._load_mode_locked(self.mode)
                     return False, err_msg
-                self.dll_paths[key] = out_dll
+                try:
+                    NativeDllWrapper(out_dll)
+                except (OSError, AttributeError) as exc:
+                    self.build_error = f"No se pudo cargar {out_dll.name}: {exc}"
+                    self.emit_log("BUILD", "ERROR", self.build_error)
+                    if self.dll is None:
+                        self._load_mode_locked(self.mode)
+                    return False, self.build_error
+                new_paths[key] = out_dll
+
+            self.dll_paths = new_paths
+            self.pins = pins
 
             self.emit_log("BUILD", "INFO", "Compilación C++ real exitosa (modo SIMULACIÓN + modo OBD-II CAN).")
             self._load_mode_locked(self.mode)
@@ -553,6 +619,10 @@ class SimManager:
     def _load_mode_locked(self, mode: str) -> None:
         self.mode = mode
         self.chat_feed = []
+        self.button_queue.clear()
+        self.pressed_pin = None
+        self.next_button_ms = 0
+        self.last_tick_ms = time.monotonic_ns() // 1_000_000
         if mode in self.dll_paths and self.dll_paths[mode].exists():
             self.dll = NativeDllWrapper(self.dll_paths[mode])
             self.dll.init()
@@ -570,12 +640,25 @@ class SimManager:
     def _loop(self) -> None:
         while self._running:
             with self.lock:
+                now_ms = time.monotonic_ns() // 1_000_000
+                elapsed_ms = now_ms - self.last_tick_ms
+                self.last_tick_ms = now_ms
                 for lvl, ev_msg in self.engine_sim.step():
                     self.emit_log("ECU_OBD", lvl, ev_msg)
                 self._sync_hw_inputs_locked()
 
                 if self.dll is not None:
-                    self.dll.tick(40)
+                    # Keep each edge stable for several ticks so the real firmware debounces it.
+                    if now_ms >= self.next_button_ms:
+                        if self.pressed_pin is not None:
+                            self.dll.set_button(self.pressed_pin, False)
+                            self.pressed_pin = None
+                            self.next_button_ms = now_ms + 120
+                        elif self.button_queue:
+                            self.pressed_pin = self.button_queue.popleft()
+                            self.dll.set_button(self.pressed_pin, True)
+                            self.next_button_ms = now_ms + 120
+                    self.dll.tick(elapsed_ms)
                     self.frame_bytes = self.dll.get_frame_bytes()
                     self.gpio_mask = self.dll.get_gpio_mask()
                     self._ingest_serial_chunk(self.dll.pop_serial())
@@ -616,6 +699,9 @@ class SimManager:
                     "INFO" if self.engine_sim.obd_connected else "WARN",
                     "Cable OBD-II CONECTADO" if self.engine_sim.obd_connected else "Cable OBD-II DESCONECTADO (sin respuesta ECU)",
                 )
+            relay_mode = body.get("relayMode")
+            if relay_mode in ("auto", "off", "low", "high1", "high2", "both"):
+                self.engine_sim.relay_mode = relay_mode
             if "autoThermal" in body:
                 self.engine_sim.auto_thermal = bool(body["autoThermal"])
                 self.emit_log("ECU_OBD", "INFO", f"Calentamiento gradual automático -> {'ACTIVO' if self.engine_sim.auto_thermal else 'MANUAL'}")
@@ -630,21 +716,15 @@ class SimManager:
                 self.emit_log("ECU_OBD", "INFO", "Motor enfriado a 28 °C (arranque en frío)")
             self._sync_hw_inputs_locked()
 
-    def pulse_button(self, pin: int) -> None:
+    def pulse_button(self, pin: int) -> bool:
         with self.lock:
+            if pin not in (number for name, number in self.pins.items() if name.startswith("PIN_BTN_")):
+                return False
             if self.dll is not None:
-                self.dll.set_button(pin, True)
-                self.dll.tick(25)
-                self.dll.tick(35)
-                self.dll.tick(20)
-                self.dll.set_button(pin, False)
-                self.dll.tick(55)
-                self.frame_bytes = self.dll.get_frame_bytes()
-                self.gpio_mask = self.dll.get_gpio_mask()
-                self._ingest_serial_chunk(self.dll.pop_serial())
-                self._ingest_can_chunk(self.dll.pop_can_log())
+                self.button_queue.append(pin)
             else:
-                self.preview.press_button(pin)
+                self.preview.press_button(pin, self.pins)
+            return True
 
     def trigger_bus_off(self) -> None:
         with self.lock:
@@ -665,7 +745,9 @@ class SimManager:
                 "compiler": self.compiler,
                 "mode": self.mode,
                 "vehicle": self.engine_sim.to_dict(),
+                "pins": self.pins,
                 "gpioMask": self.gpio_mask,
+                "eyeOn": self.dll.is_eye_on() if self.dll is not None else time.monotonic() < self.preview.eye_until,
                 "logs": self.logs[-250:],
                 "chatFeed": self.chat_feed[-20:] if is_cpp else self.preview.chat_messages[-20:],
                 "buildError": self.build_error,
@@ -733,7 +815,10 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
 
         if path == "/api/button":
-            SIM.pulse_button(int(body.get("pin", -1)))
+            pin = body.get("pin")
+            if not isinstance(pin, int) or not SIM.pulse_button(pin):
+                self._send_json({"ok": False, "message": "GPIO sin pulsador asignado"}, 400)
+                return
             self._send_json({"ok": True})
             return
 

@@ -12,11 +12,11 @@ namespace {
 
 // Paleta Matrix (RGB565): negro puro y distintos niveles de verde fósforo
 constexpr uint16_t COLOR_BG             = 0x0000; // Negro puro
-constexpr uint16_t COLOR_MATRIX_DARK    = 0x0180; // Verde oscuro (rejilla / fondo suave)
-constexpr uint16_t COLOR_MATRIX_DIM     = 0x0360; // Verde tenue (marcos y etiquetas secundarias)
-constexpr uint16_t COLOR_MATRIX_MID     = 0x05A0; // Verde medio (cabello / texto secundario)
-constexpr uint16_t COLOR_MATRIX_BRIGHT  = 0x07E0; // Verde Matrix neón (principal)
-constexpr uint16_t COLOR_MATRIX_GLOW    = 0x87F0; // Verde fosforescente claro (destello / alerta)
+constexpr uint16_t COLOR_MATRIX_DARK    = 0x502A; // Rosa oscuro (rejilla / fondo suave)
+constexpr uint16_t COLOR_MATRIX_DIM     = 0x996F; // Rosa tenue (marcos y etiquetas secundarias)
+constexpr uint16_t COLOR_MATRIX_MID     = 0xCAD6; // Rosa medio (cabello / texto secundario)
+constexpr uint16_t COLOR_MATRIX_BRIGHT  = 0xF3DB; // Rosa fosforescente suave (principal)
+constexpr uint16_t COLOR_MATRIX_GLOW    = 0xFE1C; // Rosa claro (destello / alerta)
 
 constexpr int16_t SCREEN_W = 320;
 constexpr int16_t SCREEN_H = 240;
