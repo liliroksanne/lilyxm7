@@ -39,7 +39,7 @@ echo   lilyxm7 v1.0 - Simulador OBD-II (Suzuki Grand Vitara 2008)
 echo   Logs centralizados en: %~dp0logs\
 echo ============================================================
 echo.
-echo   [1] Simulador WEB propio de lilyxm7 (Chrome/Edge, 100%% offline)
+echo   [1] Simulador WEB (compila y recarga el firmware al editar)
 echo   [2] Wokwi Web en navegador (paquete 1 clic para wokwi.com)
 echo   [3] Compilar ESP32-S3 y abrir Wokwi en VS Code
 echo   [4] Instalar herramientas (Arduino CLI, ESP32-S3 y g++ para C++ real)
@@ -89,9 +89,9 @@ if not defined PY_CMD (
     pause
     goto menu
 )
-echo [lilyxm7] Iniciando Simulador WEB propio en http://127.0.0.1:8765 ...
+echo [lilyxm7] Iniciando Simulador WEB con recarga automatica ...
 echo           (Logs en logs\sim_web.log y logs\all.log)
-"%PY_CMD%" "%~dp0sim_web\server.py"
+"%PY_CMD%" "%~dp0sim_web\server.py" --watch-firmware
 if errorlevel 1 (
     echo [ERROR] El servidor web termino con error. Revisa logs\sim_web.log
     pause

@@ -15,7 +15,9 @@ Incluye:
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import datetime as dt
+import errno
 import json
 import os
 import re
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from collections import deque
 from http import HTTPStatus
@@ -35,6 +38,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SIM_WEB_DIR = Path(__file__).resolve().parent
 NATIVE_DIR = SIM_WEB_DIR / "native"
 BUILD_DIR = SIM_WEB_DIR / "build"
+BUILD_MANIFEST = BUILD_DIR / "native-build.json"
+BUILD_RECIPE = Path(__file__).read_bytes()
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.run_logged import log_line
@@ -454,6 +459,23 @@ class PreviewFallbackEngine:
         }
 
 
+def firmware_signature(compiler: str | None) -> str:
+    digest = hashlib.sha256()
+    digest.update(BUILD_RECIPE)  # compile command and ABI of this server process
+    if compiler:
+        compiler_path = Path(compiler).resolve()
+        stat = compiler_path.stat()
+        digest.update(f"{compiler_path}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    for root in (PROJECT_ROOT / "lilyxm7", NATIVE_DIR):
+        for path in sorted(root.rglob("*")):
+            if path.suffix.lower() in {".ino", ".cpp", ".c", ".h", ".hpp", ".inc", ".s"}:
+                digest.update(str(path.relative_to(PROJECT_ROOT)).encode())
+                digest.update(b"\x00")
+                digest.update(path.read_bytes())
+                digest.update(b"\x00")
+    return digest.hexdigest()
+
+
 class SimManager:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -463,7 +485,9 @@ class SimManager:
         self.build_error: str | None = None
         self.dll: NativeDllWrapper | None = None
         self.dll_paths: dict[str, Path] = {}
-        self.dll_generation = 0
+        self.last_attempt: str | None = None
+        self.loaded_signature: str | None = None
+        self.dll_search_dir = None
         self.pins = read_pins()
         self.button_queue: deque[int] = deque()
         self.pressed_pin: int | None = None
@@ -477,7 +501,8 @@ class SimManager:
         self.preview = PreviewFallbackEngine(self.emit_log)
         self._running = True
 
-        self.compile_and_load()
+        self._restore_cached_build()
+        self.compile_and_load(force=False)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -530,81 +555,120 @@ class SimManager:
             lvl = "WARN" if "BUS_OFF" in line or "Fallo" in line else "INFO"
             self.emit_log("ECU_OBD", lvl, line)
 
-    def compile_and_load(self) -> tuple[bool, str]:
+    def _configure_dll_search(self, compiler: str | None) -> None:
+        if compiler and hasattr(os, "add_dll_directory"):
+            try:
+                directory = os.add_dll_directory(str(Path(compiler).resolve().parent))
+            except OSError:
+                return
+            if self.dll_search_dir is not None:
+                self.dll_search_dir.close()
+            self.dll_search_dir = directory
+
+    def _restore_cached_build(self) -> None:
+        try:
+            manifest = json.loads(BUILD_MANIFEST.read_text(encoding="utf-8"))
+            paths = {mode: BUILD_DIR / Path(manifest["files"][mode]).name for mode in ("sim", "obd")}
+            pins = manifest["pins"]
+            signature = manifest["signature"]
+            if not isinstance(pins, dict) or not isinstance(signature, str):
+                return
+            self._configure_dll_search(self.compiler)
+            for path in paths.values():
+                NativeDllWrapper(path)
+        except (OSError, AttributeError, TypeError, KeyError, ValueError):
+            return
+        self.dll_paths = paths
+        self.pins = pins
+        self.loaded_signature = signature
+        self._load_mode_locked(self.mode)
+        self.emit_log("BUILD", "INFO", "Firmware nativo cargado de la última compilación válida.")
+
+    def _build_failed_locked(self, message: str) -> tuple[bool, str]:
+        self.build_error = message
+        self.emit_log("BUILD", "ERROR", message)
+        if self.dll is None:
+            self._load_mode_locked(self.mode)
+        return False, message
+
+    def watch_firmware(self) -> None:
+        while self._running:
+            time.sleep(1.0)
+            self.compile_and_load(force=False)
+
+    def compile_and_load(self, *, force: bool = True) -> tuple[bool, str]:
         with self.lock:
-            self.compiler = find_cpp_compiler()
-            self.build_error = None
-            pins = read_pins()
+            compiler = find_cpp_compiler()
+            try:
+                signature = firmware_signature(compiler)
+                if not force and signature == self.last_attempt:
+                    return self.build_error is None, self.build_error or "Firmware sin cambios."
+                self.last_attempt = signature
+                self.compiler = compiler
+                self.build_error = None
+                if not force and signature == self.loaded_signature:
+                    return True, "Firmware sin cambios."
+                pins = read_pins()
+                if not compiler:
+                    if self.dll is None:
+                        self.pins = pins
+                    return self._build_failed_locked("No se encontró g++/clang++; instala el compilador con la opción [4].")
 
-            if not self.compiler:
-                msg = "No se encontro g++/clang++ en Windows. Usando motor PREVIEW (instala g++ con opcion [4] para C++ real)."
-                self.emit_log("BUILD", "WARN", msg)
-                self.build_error = msg
-                if self.dll is None:
-                    self.pins = pins
-                    self._load_mode_locked(self.mode)
-                return False, msg
-
-            BUILD_DIR.mkdir(parents=True, exist_ok=True)
-            self.dll_generation += 1
-            gen = self.dll_generation
-
-            compiler_dir = str(Path(self.compiler).parent)
-            if hasattr(os, "add_dll_directory"):
-                try:
-                    os.add_dll_directory(compiler_dir)
-                except OSError:
-                    pass
-
-            targets = [
-                ("sim", 1, BUILD_DIR / f"lilyxm7_sim_{os.getpid()}_{gen}.dll"),
-                ("obd", 0, BUILD_DIR / f"lilyxm7_obd_{os.getpid()}_{gen}.dll"),
-            ]
-
-            new_paths = {}
-            for key, sim_flag, out_dll in targets:
-                cmd = [
-                    self.compiler,
-                    "-shared",
-                    "-std=c++17",
-                    "-O2",
-                    "-static-libgcc",
-                    "-static-libstdc++",
-                    f"-DLILYXM7_SIMULATION_MODE={sim_flag}",
-                    f"-I{NATIVE_DIR}",
-                    f"-I{PROJECT_ROOT / 'lilyxm7'}",
-                    str(NATIVE_DIR / "sim_bridge.cpp"),
-                    "-o",
-                    str(out_dll),
+                self._configure_dll_search(compiler)
+                BUILD_DIR.mkdir(parents=True, exist_ok=True)
+                build_id = uuid.uuid4().hex[:16]
+                targets = [
+                    ("sim", 1, BUILD_DIR / f"lilyxm7_sim_{build_id}.dll"),
+                    ("obd", 0, BUILD_DIR / f"lilyxm7_obd_{build_id}.dll"),
                 ]
-                self.emit_log("BUILD", "INFO", f"Compilando {out_dll.name} (LILYXM7_SIMULATION_MODE={sim_flag})...")
-                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if res.stderr:
-                    for ln in res.stderr.splitlines():
-                        self.emit_log("BUILD", "ERROR" if res.returncode != 0 else "WARN", ln)
-                if res.returncode != 0:
-                    err_msg = f"Error compilando modo {key} (exit={res.returncode})"
-                    self.build_error = err_msg
-                    self.emit_log("BUILD", "ERROR", err_msg)
-                    if self.dll is None:
-                        self._load_mode_locked(self.mode)
-                    return False, err_msg
-                try:
+                new_paths = {}
+                for key, sim_flag, out_dll in targets:
+                    cmd = [
+                        compiler,
+                        "-shared",
+                        "-std=c++17",
+                        "-O2",
+                        "-static-libgcc",
+                        "-static-libstdc++",
+                        f"-DLILYXM7_SIMULATION_MODE={sim_flag}",
+                        f"-I{NATIVE_DIR}",
+                        f"-I{PROJECT_ROOT / 'lilyxm7'}",
+                        str(NATIVE_DIR / "sim_bridge.cpp"),
+                        "-o",
+                        str(out_dll),
+                    ]
+                    self.emit_log("BUILD", "INFO", f"Compilando firmware para el simulador ({key})...")
+                    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    for line in result.stderr.splitlines():
+                        self.emit_log("BUILD", "ERROR" if result.returncode else "WARN", line)
+                    if result.returncode:
+                        return self._build_failed_locked(f"Error compilando modo {key} (exit={result.returncode}).")
                     NativeDllWrapper(out_dll)
-                except (OSError, AttributeError) as exc:
-                    self.build_error = f"No se pudo cargar {out_dll.name}: {exc}"
-                    self.emit_log("BUILD", "ERROR", self.build_error)
-                    if self.dll is None:
-                        self._load_mode_locked(self.mode)
-                    return False, self.build_error
-                new_paths[key] = out_dll
+                    new_paths[key] = out_dll
+
+                if firmware_signature(compiler) != signature:
+                    self.last_attempt = None
+                    return self._build_failed_locked("El código cambió durante la compilación. Se reintentará con los archivos nuevos.")
+            except (OSError, AttributeError) as exc:
+                return self._build_failed_locked(f"Error de compilación o carga: {exc}")
 
             self.dll_paths = new_paths
             self.pins = pins
-
-            self.emit_log("BUILD", "INFO", "Compilación C++ real exitosa (modo SIMULACIÓN + modo OBD-II CAN).")
+            self.loaded_signature = signature
             self._load_mode_locked(self.mode)
-            return True, "Compilado y recargado en C++ real."
+            manifest = {
+                "signature": signature,
+                "pins": pins,
+                "files": {mode: path.name for mode, path in new_paths.items()},
+            }
+            try:
+                temp = BUILD_DIR / f"native-build-{build_id}.tmp"
+                temp.write_text(json.dumps(manifest), encoding="utf-8")
+                temp.replace(BUILD_MANIFEST)
+            except OSError as exc:
+                self.emit_log("BUILD", "WARN", f"Firmware actualizado, pero no se pudo guardar la caché: {exc}")
+            self.emit_log("BUILD", "INFO", "Firmware C++ actualizado y cargado en la ESP32 virtual.")
+            return True, "Firmware C++ actualizado."
 
     def _sync_hw_inputs_locked(self) -> None:
         t_int = int(round(self.engine_sim.coolant_c))
@@ -862,12 +926,24 @@ def main() -> int:
         if arg.startswith("--port="):
             port = int(arg.split("=", 1)[1])
 
-    server = ThreadingHTTPServer((HOST, port), Handler)
+    watch = "--watch-firmware" in sys.argv
+    try:
+        server = ThreadingHTTPServer((HOST, port), Handler)
+    except OSError as exc:
+        if not watch or exc.errno not in (errno.EADDRINUSE, 10048):
+            raise
+        server = ThreadingHTTPServer((HOST, 0), Handler)
+        print(f"El puerto {port} está ocupado. Se abrió otra instancia del simulador.")
+    port = server.server_port
+    if watch:
+        threading.Thread(target=SIM.watch_firmware, daemon=True).start()
     url = f"http://{HOST}:{port}"
     engine_label = "C++ REAL (lilyxm7/*.cpp)" if SIM.dll is not None else "PREVIEW (sin g++ aun)"
     print("============================================================")
     print(f"  lilyxm7 Web Simulator — {url}")
     print(f"  Motor activo : {engine_label}")
+    if watch:
+        print("  Actualización automática al guardar cambios del firmware.")
     print(f"  Logs         : {PROJECT_ROOT / 'logs' / 'sim_web.log'}")
     print("  Presiona Ctrl+C en esta ventana para detener el servidor.")
     print("============================================================")
@@ -882,6 +958,7 @@ def main() -> int:
         print("\n[lilyxm7] Servidor detenido.")
         log_line(LOG_COMPONENT, "Servidor web detenido por el usuario.")
     finally:
+        SIM._running = False
         server.server_close()
     return 0
 

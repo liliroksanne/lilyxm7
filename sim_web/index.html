@@ -345,6 +345,22 @@
     .battery-case .positive { background: #923853; }
     .supply-circuits { display: grid; gap: 4px; font-size: 12px; color: var(--mid); }
     .supply-circuits span[data-live="true"] { color: var(--glow); }
+    .wiring-drawing { margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--subpanel); }
+    .wiring-drawing .row + .row { margin-top: 8px; }
+    .schematic-scroll { overflow-x: auto; margin-top: 10px; }
+    .schematic { width: 100%; min-width: 620px; display: block; background: #140e17; border-radius: 6px; }
+    .schematic text { fill: #ead7e5; font-family: inherit; font-size: 13px; }
+    .schematic .pin-label { font-size: 11px; }
+    .schematic .pin-unused { fill: #8d8190; }
+    .schematic .device-label { font-size: 15px; font-weight: bold; }
+    .schematic .wire { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .schematic .wire-end { stroke: #140e17; stroke-width: 1.5; }
+    .schematic .wire-net { transition: opacity .15s; }
+    .schematic .wire-net.muted { opacity: .16; }
+    .schematic .wire-net.selected .wire { stroke-width: 5; }
+    .wire-filter { border-left: 4px solid var(--wire-color, var(--border)); }
+    .wire-filter.selected { border-left-color: var(--wire-color, var(--bright)); }
+    #wireDescription { margin-bottom: 0; }
   </style>
 </head>
 <body>
@@ -504,6 +520,15 @@
     <section class="card wiring" aria-labelledby="wiringTitle">
       <h2 id="wiringTitle" class="card-title">Cableado físico</h2>
       <p>ESP32-S3-DevKitC-1 como referencia, vista frontal con la antena arriba. En la placa LAFVIN y los módulos de tu kit, identifica las conexiones por la serigrafía.</p>
+      <div class="wiring-drawing">
+        <div class="row" id="wireGroups" aria-label="Componentes del diagrama"></div>
+        <div class="row" id="wireFilters" aria-label="Resaltar una conexión"></div>
+        <div class="schematic-scroll">
+          <svg id="wireDiagram" class="schematic" viewBox="0 0 760 568" role="img" aria-labelledby="wireTitle wireDescription"></svg>
+        </div>
+        <p id="wireDescription">Elige una señal para seguir su cable de extremo a extremo.</p>
+        <small>Terminales del módulo ordenados por señal. Identifica cada uno por su serigrafía.</small>
+      </div>
       <div class="workbench">
         <figure class="module">
           <figcaption>ESP32-S3 · GPIO del firmware</figcaption>
@@ -583,7 +608,194 @@
       ["A", "Seleccionar", "PIN_BTN_A"], ["B", "Volver", "PIN_BTN_B"],
     ];
 
+    const boardHeaders = [
+      "3V3 3V3 RST 4 5 6 7 15 16 17 18 8 3 46 9 10 11 12 13 14 5V G".split(" "),
+      "G TX RX 1 2 42 41 40 39 38 37 36 35 0 45 48 47 21 20 19 G G".split(" "),
+    ];
+    const wireColors = ["#ff828f", "#c5becd", "#80ccff", "#e8aa78", "#c2a3ff",
+      "#f388d7", "#ffe083", "#77dfba", "#e699ef"];
+    let wireGroup = "tft";
+
+    function renderWireDiagram(pins) {
+      const svg = document.getElementById("wireDiagram");
+      const gpio = key => String(pins[key]);
+      const groups = {
+        tft: {
+          label: "Pantalla TFT",
+          title: "ILI9341 · vista frontal",
+          nets: tftSignals.map(([signal, target], index) => ({
+            signal, board: target === "GND" ? "G" : target in pins ? gpio(target) : target,
+            y: 292 + index * 24, optional: target === "PIN_TFT_BL",
+          })),
+        },
+        controls: {
+          label: "Botones y ojo LED",
+          title: "Pulsadores y ojo LED",
+          nets: [
+            ...menuButtons.map(([signal, action, target], index) =>
+              ({signal: signal + " " + action, board: gpio(target), y: 129 + index * 55})),
+            {signal: "LED + / 330 Ω", board: gpio("PIN_LILY_EYE"), y: 370},
+            {signal: "Retorno común", board: "G", y: 455, ground: true},
+          ],
+        },
+        can: {
+          label: "CAN y puerto OBD-II",
+          title: "SN65HVD230 y OBD-II",
+          nets: [
+            {signal: "VCC / 3V3", board: "3V3", y: 151},
+            {signal: "GND", board: "G", y: 190},
+            {signal: "CTX / D", board: gpio("PIN_CAN_TX"), y: 229},
+            {signal: "CRX / R", board: gpio("PIN_CAN_RX"), y: 268},
+            {signal: "CANH → OBD 6", y: 345, obd: 6},
+            {signal: "CANL → OBD 14", y: 387, obd: 14},
+            {signal: "GND → OBD 4 y 5", y: 429, obd: 4, branch: "M73 190 H306 M260 429 V444 H292"},
+          ],
+        },
+        power: {
+          label: "Batería, relés y ventiladores",
+          title: "Potencia y bobinas · Vitara 2WD",
+          nets: [
+            {signal: "Batería +", info: "Batería + → fusibles OEM RDTR2 (3) y RDTR (2).", points: [[134,103],[157,103],[157,82],[185,82]], branch: "M157 103 V179 H185"},
+            {signal: "RDTR2 · E29 · motor 1", info: "RDTR2 → E29-1. El contacto E29-2 alimenta el motor 1 en E26-2.", points: [[292,82],[360,82]], branch: "M473 82 H575"},
+            {signal: "Retorno motor 1", info: "Ventilador 1 E26-1 → E31-1 (común de la conmutación).", points: [[681,82],[710,82],[710,263],[488,263],[488,282]]},
+            {signal: "RDTR · E30 · motor 2", info: "RDTR → E30-1. E30-2 alimenta E27-2 y comparte ese nodo con E31-4.", points: [[292,179],[360,179]], branch: "M473 179 H552 V310 H575 M552 310 H524"},
+            {signal: "Masa", info: "E27-1 y E31-2 → masa de chasis → batería −.", points: [[80,136],[80,482],[710,482],[710,310],[681,310]], branch: "M488 361 V482"},
+            {signal: "IG2 SIG · bobinas", info: "Fusible OEM IG2 SIG (32) → terminal 3 de cada relé.", points: [[292,388],[320,388],[320,53],[388,53],[388,64]], branch: "M320 151 H388 V160 M320 269 H460 V282"},
+            {signal: "ECM · bobinas", info: "Terminal 5 de cada bobina hacia las tres salidas de mando de la ECM.", points: [[292,423],[335,423],[335,113],[442,113],[442,100]], branch: "M292 435 H345 V217 H442 V198 M292 447 H359 V375 H449 V361"},
+          ],
+        },
+      };
+      const selected = groups[wireGroup];
+      const active = new Set(selected.nets.map(net => net.board));
+      const pcbX = 566;
+      const headers = boardHeaders.map((labels, column) => labels.map((label, index) => {
+        const x = column === 0 ? pcbX : 714;
+        const y = 64 + index * 21;
+        return {label, column, x, y};
+      }));
+      const contacts = headers.flat().map(pin =>
+        '<circle cx="' + pin.x + '" cy="' + pin.y + '" r="5.5" fill="' +
+        (active.has(pin.label) ? "#f5d179" : "#5e5261") + '"/>' +
+        '<text class="pin-label ' + (active.has(pin.label) ? "" : "pin-unused") + '" x="' +
+        (pin.x + (pin.column === 0 ? 11 : -11)) + '" y="' + (pin.y + 4) + '"' +
+        (pin.column === 1 ? ' text-anchor="end"' : "") + '>' + pin.label + '</text>').join("");
+      const board = '<rect x="553" y="37" width="174" height="504" rx="12" fill="#24282a" stroke="#657174"/>' +
+        '<rect x="606" y="56" width="68" height="26" rx="3" fill="#725634"/>' +
+        '<rect x="598" y="82" width="84" height="94" rx="4" fill="#525e60" stroke="#b1bec2"/>' +
+        '<text x="640" y="130" text-anchor="middle">ESP32-S3</text>' +
+        '<rect x="617" y="502" width="46" height="24" rx="4" fill="#85979b"/>' +
+        '<text x="640" y="519" text-anchor="middle">USB</text>' + contacts;
+      const powerParts = [
+        [27,72,107,64,"Batería 12 V","#623246"],
+        [185,64,107,36,"RDTR2 · 30 A","#463b31"],
+        [185,160,107,38,"RDTR · 30 A","#463b31"],
+        [360,64,113,36,"Relé 1 · E29","#343740"],
+        [360,160,113,38,"Relé 2 · E30","#343740"],
+        [575,64,106,36,"Motor 1 · E26","#41434e"],
+        [575,291,106,38,"Motor 2 · E27","#41434e"],
+        [431,282,93,79,"Relé 3 · E31","#343740"],
+        [174,370,118,36,"IG2 SIG · 15 A","#463b31"],
+        [174,414,118,43,"ECM · mandos","#343740"],
+      ];
+      const powerDrawing = powerParts.map(([x, y, w, h, label, fill]) =>
+        '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="6" fill="' + fill +
+        '" stroke="#938496"/><text x="' + (x + w/2) + '" y="' + (y + h/2 + 4) +
+        '" text-anchor="middle">' + label + '</text>').join("") +
+        '<text x="117" y="107">+</text><text x="73" y="127">−</text>' +
+        '<text x="439" y="303" class="pin-label">4 · serie</text><text x="438" y="348" class="pin-label">2 · masa</text>' +
+        '<text x="554" y="505">Masa de chasis</text>';
+      const component = wireGroup === "power" ? powerDrawing : wireGroup === "tft"
+        ? '<rect x="32" y="54" width="274" height="464" rx="9" fill="#742a3d" stroke="#bb6574"/>' +
+          '<rect x="53" y="92" width="232" height="168" rx="6" fill="#0b090e" stroke="#5d515d" stroke-width="7"/>' +
+          '<text x="169" y="182" text-anchor="middle" fill="#f078b8">TFT ILI9341</text>'
+        : wireGroup === "controls"
+        ? '<rect x="32" y="82" width="274" height="405" rx="9" fill="#343037" stroke="#71647a"/>' +
+          [129,184,239,294].map(y => '<rect x="62" y="' + (y-17) + '" width="42" height="34" rx="5" fill="#695f6c"/>' +
+            '<circle cx="83" cy="' + y + '" r="11" fill="#16131a"/>').join("") +
+          '<circle cx="83" cy="370" r="16" fill="#813052" stroke="#cb749c"/>'
+        : '<rect x="32" y="112" width="274" height="189" rx="9" fill="#21466a" stroke="#6fa1c2"/>' +
+          '<text x="55" y="138">SN65HVD230</text>' +
+          '<rect x="32" y="322" width="274" height="131" rx="9" fill="#35323b" stroke="#6c6370"/>' +
+          '<text x="55" y="442">OBD-II · puerto hembra</text>';
+      const nets = selected.nets.map((net, index) => {
+        const color = wireColors[index];
+        const namedBoard = net.board === "G" ? "ESP32 GND" : net.board === "3V3" ? "ESP32 3V3" : "ESP32 GPIO " + net.board;
+        const info = net.info ?? (net.board ? namedBoard + " ↔ " + net.signal + (net.optional ? " (opcional, entrada BL compatible)" : "")
+          : "SN65HVD230 " + net.signal);
+        let points;
+        if (net.points) {
+          points = net.points;
+        } else if (net.obd) {
+          const tapY = net.obd === 4 ? 190 : net.obd === 6 ? 244 : 270;
+          const portY = net.y;
+          const x = net.obd === 4 ? 73 : net.obd === 6 ? 101 : 130;
+          points = [[x, tapY], [x, portY], [306, portY]];
+        } else {
+          const pin = headers.flat().find(entry => entry.label === net.board &&
+            (net.board !== "G" || entry.column === 0));
+          if (!pin) return {signal: net.signal, info, color, markup: ""};
+          const track = 336 + index * 24;
+          const startX = wireGroup === "controls" && !net.ground ? 104 : 306;
+          points = [[startX, net.y], [track, net.y]];
+          if (pin.column === 1) points.push([track, 552], [744, 552], [744, pin.y]);
+          else points.push([track, pin.y]);
+          points.push([pin.x, pin.y]);
+        }
+        const [[x0, y0]] = points;
+        const [x1, y1] = points.at(-1);
+        const controlReturn = net.ground ? '<path class="wire" d="M40 455 H306 M40 455 V144 M40 144 H62 M40 199 H62 M40 254 H62 M40 309 H62 M40 385 H67" stroke="' + color + '"/>' : "";
+        const resistor = wireGroup === "controls" && net.signal.startsWith("LED") ? '<rect x="143" y="363" width="31" height="14" rx="3" fill="#e5bf86" stroke="#6c5147"/>' : "";
+        const extraPath = net.branch ? '<path class="wire" d="' + net.branch + '" stroke="' + color + '"/>' : "";
+        return {signal: net.signal, info, color, markup:
+          '<g class="wire-net" data-wire="' + index + '"><title>' + info + '</title>' + controlReturn + extraPath +
+          '<polyline class="wire" stroke="' + color + '" points="' + points.map(p => p.join(",")).join(" ") + '"/>' + resistor +
+          '<circle class="wire-end" cx="' + x0 + '" cy="' + y0 + '" r="6" fill="' + color + '"/>' +
+          '<circle class="wire-end" cx="' + x1 + '" cy="' + y1 + '" r="6" fill="' + color + '"/></g>'};
+      });
+      const labels = wireGroup === "power" ? "" : selected.nets.map(net => '<text x="291" y="' + (net.y - 6) + '" text-anchor="end">' +
+        net.signal + '</text>').join("");
+      svg.innerHTML = '<title id="wireTitle">' + selected.title + '</title>' + (wireGroup === "power" ? "" : board) + component +
+        '<text class="device-label" x="33" y="27">' + selected.title + '</text>' +
+        (wireGroup === "power" ? "" : '<text class="device-label" x="553" y="27">ESP32-S3 DevKitC-1</text>') +
+        nets.map(net => net.markup).join("") + labels;
+
+      const filters = document.getElementById("wireFilters");
+      const filter = index => {
+        svg.querySelectorAll(".wire-net").forEach(wire => {
+          const chosen = Number(wire.dataset.wire) === index;
+          wire.classList.toggle("selected", chosen);
+          wire.classList.toggle("muted", index !== -1 && !chosen);
+        });
+        Array.from(filters.children).forEach((button, i) => {
+          button.classList.toggle("selected", i === index + 1);
+          button.setAttribute("aria-pressed", i === index + 1);
+        });
+        document.getElementById("wireDescription").textContent = index === -1
+          ? "Elige una señal para seguir su cable de extremo a extremo." : nets[index].info;
+      };
+      filters.replaceChildren(...[{signal: "Todos"}, ...nets].map((net, i) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "mode-btn wire-filter";
+        button.textContent = net.signal;
+        if (net.color) button.style.setProperty("--wire-color", net.color);
+        button.onclick = () => filter(i - 1);
+        return button;
+      }));
+      filter(-1);
+      document.getElementById("wireGroups").replaceChildren(...Object.entries(groups).map(([key, group]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "mode-btn" + (key === wireGroup ? " selected" : "");
+        button.textContent = group.label;
+        button.setAttribute("aria-pressed", key === wireGroup);
+        button.onclick = () => { wireGroup = key; renderWireDiagram(pins); };
+        return button;
+      }));
+    }
+
     function renderWiring(pins) {
+      renderWireDiagram(pins);
       const gpio = key => 'GPIO ' + pins[key];
       const rows = (id, heading, connections) => {
         document.getElementById(id).innerHTML =
@@ -609,12 +821,9 @@
       document.getElementById("tftHeader").innerHTML = tftSignals.map(([name]) => '<span>' + name + '</span>').join('');
       const activePins = new Set(["3V3", "G", ...Object.entries(pins)
         .filter(([key]) => !key.startsWith("PIN_SIM_")).map(([, pin]) => String(pin))]);
-      const headers = {
-        headerJ1: "3V3 3V3 RST 4 5 6 7 15 16 17 18 8 3 46 9 10 11 12 13 14 5V G",
-        headerJ3: "G TX RX 1 2 42 41 40 39 38 37 36 35 0 45 48 47 21 20 19 G G",
-      };
+      const headers = { headerJ1: boardHeaders[0], headerJ3: boardHeaders[1] };
       for (const [id, labels] of Object.entries(headers)) {
-        document.getElementById(id).innerHTML = labels.split(" ").map(pin =>
+        document.getElementById(id).innerHTML = labels.map(pin =>
           '<span class="contact' + (activePins.has(pin) ? ' active-pin' : '') + '">' + pin + '</span>').join('');
       }
       const obdPins = {4: "Tierra de chasis", 5: "Tierra de señal", 6: "CAN-H", 14: "CAN-L", 16: "+12 V"};
@@ -994,8 +1203,11 @@
       else if (e.key === "b" || e.key === "B" || e.key === "Escape") { pressBtn(buttonPins[3]); }
     });
 
-    setInterval(refresh, 130);
-    refresh();
+    async function poll() {
+      await refresh();
+      setTimeout(poll, 130);
+    }
+    poll();
   </script>
 </body>
 </html>
