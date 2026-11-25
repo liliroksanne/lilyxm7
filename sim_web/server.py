@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-Servidor Web local (100% offline, solo stdlib de Python) para el simulador propio de lilyxm7.
+Servidor Web local (100% offline, solo stdlib de Python) para lilyxm7.
 
-- Si detecta g++ (MinGW/WinLibs) o clang++ en Windows, compila TU CODIGO C++ REAL
-  de lilyxm7/ en dos DLLs nativas (modo SIMULACION y modo OBD-II CAN real) y transmite
-  en vivo el framebuffer real de 320x240 pixeles + Serial.printf + tramas CAN a la web.
-- Si aun no hay g++ instalado, arranca inmediatamente en modo PREVIEW interactivo
-  (mientras te indica como activar el motor C++ real con 1 comando).
+Incluye:
+- Motor C++ REAL (compila lilyxm7/*.cpp en DLLs nativas si existe g++/clang++)
+  o motor PREVIEW automatico si aun no se instala g++.
+- Simulador termico realista del motor / ECU OBD-II de la Suzuki Grand Vitara 2008 V6 2.7L
+  (se calienta poco a poco desde frio ~28 °C hasta temperatura de operacion ~89-92 °C,
+  con escenarios de manejo, ignicion ON/OFF, falla de termostato y desconexion OBD-II).
+- Logs estructurados POR COMPONENTE (ECU_OBD, DATA, CHAT, BTN, UI, BUILD) enviados en vivo
+  al frontend y guardados en C:\\Git\\lilyxm7\\logs\\sim_web.log y logs\\all.log.
 """
 
 from __future__ import annotations
 
 import ctypes
+import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +41,8 @@ from tools.run_logged import log_line
 LOG_COMPONENT = "sim_web"
 HOST = "127.0.0.1"
 PORT = 8765
+
+SERIAL_TAG_RE = re.compile(r"^\[LOG\]\[([A-Z0-9_]+)\]\s*(.*)$")
 
 
 def find_cpp_compiler() -> str | None:
@@ -68,12 +75,109 @@ def find_cpp_compiler() -> str | None:
     return None
 
 
+class VitaraEngineSim:
+    """Modelo termico gradual de la Suzuki Grand Vitara 2008 V6 2.7 L (motor N27A)."""
+
+    PROFILES = {
+        "idle":    {"label": "Ralentí (Idle)",       "target": 89.0,  "rate": 1.1, "rpm": 750},
+        "city":    {"label": "Ciudad",               "target": 93.0,  "rate": 1.8, "rpm": 2100},
+        "highway": {"label": "Carretera / Subida",   "target": 98.0,  "rate": 2.6, "rpm": 3400},
+        "fault":   {"label": "Falla termostato",     "target": 116.0, "rate": 3.4, "rpm": 2600},
+    }
+
+    def __init__(self) -> None:
+        self.ambient_c = 26.0
+        self.coolant_c = 28.0
+        self.ignition = "RUNNING"  # OFF | ACC_ON | RUNNING
+        self.profile = "idle"
+        self.obd_connected = True
+        self.auto_thermal = True
+        self.fan_on = False
+        self.thermostat_open = False
+        self._last_ts = time.monotonic()
+        self._last_logged_int = 28
+
+    def reset_cold(self) -> None:
+        self.coolant_c = 28.0
+        self.fan_on = False
+        self.thermostat_open = False
+        self._last_logged_int = 28
+
+    def is_ecu_responding(self) -> bool:
+        # En la Vitara 2008 la ECU responde con ignicion en ON o motor encendido + cable conectado
+        return self.obd_connected and self.ignition in ("ACC_ON", "RUNNING")
+
+    def step(self) -> list[tuple[str, str]]:
+        """Avanza la fisica termica y devuelve eventos importantes [(level, msg), ...]."""
+        now = time.monotonic()
+        dt_s = max(0.0, min(0.5, now - self._last_ts))
+        self._last_ts = now
+        events: list[tuple[str, str]] = []
+
+        if not self.auto_thermal:
+            return events
+
+        if self.ignition == "RUNNING":
+            prof = self.PROFILES.get(self.profile, self.PROFILES["idle"])
+            target = prof["target"]
+            rate = prof["rate"]
+            if self.coolant_c < target:
+                # Calentamiento progresivo (mas rapido al inicio, mas suave cerca del termostato)
+                factor = 1.0 if (target - self.coolant_c) > 10.0 else 0.45
+                self.coolant_c = min(target, self.coolant_c + rate * factor * dt_s)
+            elif self.coolant_c > target:
+                self.coolant_c = max(target, self.coolant_c - 1.4 * dt_s)
+        else:
+            # Motor apagado -> enfriamiento gradual hacia temperatura ambiente
+            if self.coolant_c > self.ambient_c:
+                self.coolant_c = max(self.ambient_c, self.coolant_c - 1.2 * dt_s)
+
+        # Histéresis del termostato (~82 °C) y electroventilador (~95 °C, salvo en falla)
+        if not self.thermostat_open and self.coolant_c >= 82.0:
+            self.thermostat_open = True
+            events.append(("INFO", "Termostato abierto (~82 °C), regulando flujo de refrigerante"))
+        elif self.thermostat_open and self.coolant_c <= 76.0:
+            self.thermostat_open = False
+
+        if self.profile != "fault":
+            if not self.fan_on and self.coolant_c >= 94.0:
+                self.fan_on = True
+                events.append(("INFO", "Electroventilador ENCENDIDO (>= 94 °C)"))
+            elif self.fan_on and self.coolant_c <= 89.0:
+                self.fan_on = False
+                events.append(("INFO", "Electroventilador APAGADO (<= 89 °C)"))
+        else:
+            self.fan_on = False
+
+        cur_int = int(round(self.coolant_c))
+        if abs(cur_int - self._last_logged_int) >= 5:
+            self._last_logged_int = cur_int
+            events.append(("INFO", f"Motor Vitara 2.7L -> refrigerante={self.coolant_c:.1f} °C ({self.ignition}/{self.profile})"))
+
+        return events
+
+    def to_dict(self) -> dict[str, Any]:
+        prof = self.PROFILES.get(self.profile, self.PROFILES["idle"])
+        return {
+            "coolantC": round(self.coolant_c, 1),
+            "coolantInt": int(round(self.coolant_c)),
+            "ignition": self.ignition,
+            "profile": self.profile,
+            "profileLabel": prof["label"],
+            "rpm": prof["rpm"] if self.ignition == "RUNNING" else 0,
+            "obdConnected": self.obd_connected,
+            "autoThermal": self.auto_thermal,
+            "ecuResponding": self.is_ecu_responding(),
+            "thermostatOpen": self.thermostat_open,
+            "fanOn": self.fan_on,
+        }
+
+
 class NativeDllWrapper:
-    """Carga y controla una instancia DLL compilada desde sim_bridge.cpp + lilyxm7/."""
+    """Carga y controla una DLL compilada desde sim_bridge.cpp + lilyxm7/."""
 
     def __init__(self, dll_path: Path) -> None:
         self.dll_path = dll_path
-        # En Windows con Python 3.8+, agregar el directorio del compilador por si depende de libstdc++/libgcc
         self.lib = ctypes.CDLL(str(dll_path))
         self.lib.sim_init.argtypes = []
         self.lib.sim_tick.argtypes = [ctypes.c_uint32]
@@ -132,21 +236,22 @@ class NativeDllWrapper:
 
 
 class PreviewFallbackEngine:
-    """Motor ligero de respaldo si aun no se instala g++ (permite usar la web de inmediato)."""
+    """Motor de respaldo con chatbot Lily cuando aun no se instala g++."""
 
-    def __init__(self) -> None:
-        self.reset("sim")
+    def __init__(self, emit_log) -> None:
+        self._emit = emit_log
+        self.reset("obd")
 
     def reset(self, mode: str) -> None:
         self.mode = mode
-        self.screen = "MAIN_MENU"
+        self.screen = "TEMPERATURE"
         self.selected_idx = 0
-        self.temp_c = 86
+        self.temp_c = 28
         self.signal_on = True
         self.has_live = False
         self.has_last = False
-        self.last_temp = 86
-        self.prev_temp = 86
+        self.last_temp = 28
+        self.prev_temp = 28
         self.delta_c = 0
         self.trend = "NONE"
         self.valid_count = 0
@@ -155,30 +260,52 @@ class PreviewFallbackEngine:
         self.last_poll_ts = 0.0
         self.anim_tick = 0
         self.last_anim_ts = time.monotonic()
-        self.serial_lines: list[str] = [
-            "========================================",
-            "  lilyxm7 v1.0 - Motor PREVIEW Web",
-            "  (Instala g++ con opcion [4] para ejecutar el C++ real)",
-            "========================================",
-        ]
-        self.can_lines: list[str] = [
-            "[PREVIEW] Modo simulado listo. Instala g++ para compilar lilyxm7/*.cpp real."
-        ]
+        self.prev_mood = "MENU_IDLE"
+        self.last_announced_temp = -999
+        self.chat_messages: list[dict[str, Any]] = []
+        self._push_chat("Hola! Soy Lily v1.0.", False)
+        self._push_chat("Modo SIMULACIÓN activo." if mode == "sim" else "Lista p/ Vitara 2.7L.", False)
+
+    def _push_chat(self, text: str, is_alert: bool) -> None:
+        if self.chat_messages and self.chat_messages[-1]["text"] == text:
+            return
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        self.chat_messages.append({"ts": ts, "text": text, "isAlert": is_alert})
+        if len(self.chat_messages) > 25:
+            self.chat_messages = self.chat_messages[-25:]
+        self._emit("CHAT", "WARN" if is_alert else "INFO", f"LILY: {text}")
+
+    def _mood_from_temp(self) -> tuple[str, str, bool]:
+        if not self.has_live:
+            return ("NO_SIGNAL", "SIN SENAL", True)
+        if self.last_temp <= 59:
+            return ("COLD", "MOTOR FRIO", False)
+        if self.last_temp <= 79:
+            return ("WARMING", "CALENTANDO", False)
+        if self.last_temp <= 97:
+            return ("OPTIMAL", "OPTIMO", False)
+        if self.last_temp <= 107:
+            return ("WARM_WARN", "TEMP ALTA", True)
+        return ("OVERHEAT", "PELIGRO!", True)
 
     def press_button(self, pin: int) -> None:
+        names = {4: "UP", 5: "DOWN", 6: "A", 7: "B"}
+        self._emit("BTN", "INFO", f"Pulsado {names.get(pin, pin)} (GPIO {pin})")
         if self.screen == "MAIN_MENU":
             if pin == 4:
                 self.selected_idx = (self.selected_idx - 1) % 2
-                self.serial_lines.append(f"[LOG][BTN] UP -> opcion={self.selected_idx}")
+                self._emit("UI", "INFO", f"Cursor menú -> {'Temperatura' if self.selected_idx == 0 else 'Estado de conexión'}")
             elif pin == 5:
                 self.selected_idx = (self.selected_idx + 1) % 2
-                self.serial_lines.append(f"[LOG][BTN] DOWN -> opcion={self.selected_idx}")
+                self._emit("UI", "INFO", f"Cursor menú -> {'Temperatura' if self.selected_idx == 0 else 'Estado de conexión'}")
             elif pin == 6:
                 self.screen = "TEMPERATURE" if self.selected_idx == 0 else "CONNECTION_STATUS"
-                self.serial_lines.append(f"[LOG][UI] pantalla={self.screen}")
+                self._emit("UI", "INFO", f"Cambio de pantalla -> {self.screen}")
+                self._push_chat("Abriendo Temperatura..." if self.screen == "TEMPERATURE" else "Revisando enlace ECU.", False)
         elif pin == 7:
             self.screen = "MAIN_MENU"
-            self.serial_lines.append("[LOG][UI] regreso a MAIN_MENU")
+            self._emit("UI", "INFO", "Regreso a pantalla -> MAIN_MENU")
+            self._push_chat("Menú principal listo.", False)
 
     def tick(self) -> None:
         now = time.monotonic()
@@ -191,7 +318,8 @@ class PreviewFallbackEngine:
             self.last_poll_ts = now
             self.tx_count += 1
             if self.mode == "obd":
-                self.can_lines.append("TX 0x7DF [8] 02 01 05 00 00 00 00 00")
+                self._emit("ECU_OBD", "INFO", "TX 0x7DF [8] 02 01 05 00 00 00 00 00")
+
             if self.signal_on:
                 was_off = not self.has_live
                 old_t = self.last_temp
@@ -207,26 +335,53 @@ class PreviewFallbackEngine:
                     self.last_temp = self.temp_c
                     self.delta_c = diff
                     self.trend = "UP" if diff >= 1 else ("DOWN" if diff <= -1 else "STABLE")
+
                 self.has_live = True
                 self.last_valid_ts = now
                 self.valid_count += 1
                 byte_a = max(0, min(255, self.temp_c + 40))
+
                 if self.mode == "obd":
-                    self.can_lines.append(f"RX 0x7E8 [8] 03 41 05 {byte_a:02X} 00 00 00 00  (A={byte_a} -> {self.temp_c} °C)")
+                    self._emit("ECU_OBD", "INFO", f"RX 0x7E8 [8] 03 41 05 {byte_a:02X} 00 00 00 00 (A={byte_a} -> {self.temp_c} °C)")
+
                 if was_off or self.temp_c != old_t:
-                    self.serial_lines.append(f"[LOG][DATA] temp={self.temp_c}C delta={self.delta_c:+d}C trend={self.trend}")
+                    self._emit("DATA", "INFO", f"Lectura válida: {self.temp_c} °C | tendencia={self.trend} ({self.delta_c:+d} °C)")
+
+                mood, _, _ = self._mood_from_temp()
+                mood_changed = mood != self.prev_mood
+                big_step = self.last_announced_temp == -999 or abs(self.last_temp - self.last_announced_temp) >= 3
+                if was_off or mood_changed or big_step:
+                    if was_off and self.last_announced_temp != -999:
+                        self._push_chat(f"Señal OK! Ahora {self.last_temp}°C", False)
+                    elif mood == "COLD":
+                        self._push_chat(f"Subió a {self.last_temp}°C, calent." if self.trend == "UP" else f"Motor frío: {self.last_temp}°C.", False)
+                    elif mood == "WARMING":
+                        self._push_chat(f"Calentando: {self.last_temp}°C (+)" if self.trend == "UP" else f"Tomando temp: {self.last_temp}°C.", False)
+                    elif mood == "OPTIMAL":
+                        if mood_changed:
+                            self._push_chat(f"{self.last_temp}°C! Temp óptima :)", False)
+                        elif self.trend == "UP":
+                            self._push_chat(f"Subió a {self.last_temp}°C (ideal).", False)
+                        else:
+                            self._push_chat(f"Bajó a {self.last_temp}°C (ideal).", False)
+                    elif mood == "WARM_WARN":
+                        self._push_chat(f"Ojo! Temp alta: {self.last_temp}°C", True)
+                    elif mood == "OVERHEAT":
+                        self._push_chat(f"ALERTA! {self.last_temp}°C detente!", True)
+                    self.last_announced_temp = self.last_temp
+                    self.prev_mood = mood
             else:
                 if self.has_live and (now - self.last_valid_ts) >= 3.0:
                     self.has_live = False
-                    self.serial_lines.append(f"[LOG][DATA] SIN DATOS DEL AUTO | ultima_lectura={self.last_temp}C")
-
-        if len(self.serial_lines) > 150:
-            self.serial_lines = self.serial_lines[-150:]
-        if len(self.can_lines) > 150:
-            self.can_lines = self.can_lines[-150:]
+                    self.prev_mood = "NO_SIGNAL"
+                    self._emit("DATA", "WARN", f"SIN DATOS DEL AUTO | última lectura conservada: {self.last_temp} °C")
+                    self._push_chat("Sin datos del auto!", True)
+                    if self.has_last:
+                        self._push_chat(f"Última lectura: {self.last_temp}°C", True)
 
     def snapshot(self) -> dict[str, Any]:
         age = int(time.monotonic() - self.last_valid_ts) if self.has_last else 0
+        mood, mood_tag, is_alert = self._mood_from_temp()
         return {
             "screen": self.screen,
             "selectedIdx": self.selected_idx,
@@ -241,69 +396,100 @@ class PreviewFallbackEngine:
             "ageSec": age,
             "animTick": self.anim_tick,
             "isSimulated": self.mode == "sim",
+            "mood": mood,
+            "moodTag": mood_tag,
+            "isAlert": is_alert,
+            "chatMessages": self.chat_messages[-12:],
         }
 
 
 class SimManager:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.mode = "sim"  # "sim" | "obd"
-        self.temp_c = 86
-        self.signal_on = True
+        self.mode = "obd"  # Arranca listo con el simulador OBD-II de la Vitara 2008
+        self.engine_sim = VitaraEngineSim()
         self.compiler = find_cpp_compiler()
-        self.build_log: list[str] = []
         self.build_error: str | None = None
         self.dll: NativeDllWrapper | None = None
         self.dll_paths: dict[str, Path] = {}
         self.dll_generation = 0
         self.frame_bytes: bytes = bytes(320 * 240 * 3)
         self.gpio_mask: int = 0
-        self.serial_lines: list[str] = []
-        self.can_lines: list[str] = []
-        self.preview = PreviewFallbackEngine()
+        self.log_seq = 0
+        self.logs: list[dict[str, Any]] = []
+        self.chat_feed: list[dict[str, Any]] = []
+        self.preview = PreviewFallbackEngine(self.emit_log)
         self._running = True
 
         self.compile_and_load()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def _append_serial_text(self, chunk: str) -> None:
-        if not chunk:
-            return
-        for line in chunk.splitlines():
-            self.serial_lines.append(line)
-            log_line(LOG_COMPONENT, f"SERIAL: {line}")
-        if len(self.serial_lines) > 200:
-            self.serial_lines = self.serial_lines[-200:]
+    def emit_log(self, comp: str, level: str, msg: str) -> None:
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        self.log_seq += 1
+        entry = {"id": self.log_seq, "ts": ts, "comp": comp, "level": level, "msg": msg}
+        self.logs.append(entry)
+        if len(self.logs) > 400:
+            self.logs = self.logs[-400:]
 
-    def _append_can_text(self, chunk: str) -> None:
+        if comp == "CHAT":
+            clean = msg[6:].strip() if msg.startswith("LILY:") else msg
+            self.chat_feed.append({"ts": ts, "text": clean, "isAlert": level == "WARN"})
+            if len(self.chat_feed) > 30:
+                self.chat_feed = self.chat_feed[-30:]
+
+        log_line(LOG_COMPONENT, f"[{comp}] {msg}", level=level)
+
+    def _ingest_serial_chunk(self, chunk: str) -> None:
         if not chunk:
             return
-        for line in chunk.splitlines():
-            self.can_lines.append(line)
-            log_line(LOG_COMPONENT, f"CAN: {line}")
-        if len(self.can_lines) > 200:
-            self.can_lines = self.can_lines[-200:]
+        for raw in chunk.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = SERIAL_TAG_RE.match(line)
+            if m:
+                tag, rest = m.group(1), m.group(2)
+                comp_map = {
+                    "OBD": "ECU_OBD",
+                    "DATA": "DATA",
+                    "CHAT": "CHAT",
+                    "BTN": "BTN",
+                    "UI": "UI",
+                }
+                comp = comp_map.get(tag, "DATA")
+                lvl = "WARN" if ("SIN DATOS" in rest.upper() or "ERROR" in rest.upper() or "ALERTA" in rest.upper() or "OJO" in rest.upper() or "BUS_OFF" in rest.upper()) else "INFO"
+                self.emit_log(comp, lvl, rest)
+            else:
+                self.emit_log("UI", "INFO", line)
+
+    def _ingest_can_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
+        for raw in chunk.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            lvl = "WARN" if "BUS_OFF" in line or "Fallo" in line else "INFO"
+            self.emit_log("ECU_OBD", lvl, line)
 
     def compile_and_load(self) -> tuple[bool, str]:
         with self.lock:
             self.compiler = find_cpp_compiler()
-            self.build_log = []
             self.build_error = None
 
             if not self.compiler:
-                msg = "No se encontro g++/clang++ en Windows. Usando modo PREVIEW (ejecuta opcion [4] en el .bat para instalar g++ y activar motor C++ real)."
-                self.build_log.append(msg)
-                log_line(LOG_COMPONENT, msg, level="WARN")
+                msg = "No se encontro g++/clang++ en Windows. Usando motor PREVIEW (instala g++ con opcion [4] para C++ real)."
+                self.emit_log("BUILD", "WARN", msg)
                 self.dll = None
-                self.preview.reset(self.mode)
+                self._load_mode_locked(self.mode)
                 return False, msg
 
             BUILD_DIR.mkdir(parents=True, exist_ok=True)
             self.dll_generation += 1
             gen = self.dll_generation
 
-            # Limpiar DLLs viejas si ya no están bloqueadas
             for old in BUILD_DIR.glob("lilyxm7_*.dll"):
                 try:
                     old.unlink()
@@ -337,89 +523,116 @@ class SimManager:
                     "-o",
                     str(out_dll),
                 ]
-                self.build_log.append(f"$ {' '.join(cmd)}")
-                log_line(LOG_COMPONENT, f"Compilando {out_dll.name} (sim={sim_flag})...")
+                self.emit_log("BUILD", "INFO", f"Compilando {out_dll.name} (LILYXM7_SIMULATION_MODE={sim_flag})...")
                 res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if res.stdout:
-                    self.build_log.extend(res.stdout.splitlines())
                 if res.stderr:
-                    self.build_log.extend(res.stderr.splitlines())
+                    for ln in res.stderr.splitlines():
+                        self.emit_log("BUILD", "ERROR" if res.returncode != 0 else "WARN", ln)
                 if res.returncode != 0:
                     err_msg = f"Error compilando modo {key} (exit={res.returncode})"
                     self.build_error = err_msg
-                    self.build_log.append(err_msg)
-                    log_line(LOG_COMPONENT, err_msg + "\n" + res.stderr, level="ERROR")
+                    self.emit_log("BUILD", "ERROR", err_msg)
                     self.dll = None
                     return False, err_msg
                 self.dll_paths[key] = out_dll
 
-            self.build_log.append("[OK] Compilacion C++ real exitosa (sim + obd).")
-            log_line(LOG_COMPONENT, "Compilacion C++ real exitosa (sim + obd).")
+            self.emit_log("BUILD", "INFO", "Compilación C++ real exitosa (modo SIMULACIÓN + modo OBD-II CAN).")
             self._load_mode_locked(self.mode)
             return True, "Compilado y recargado en C++ real."
 
+    def _sync_hw_inputs_locked(self) -> None:
+        t_int = int(round(self.engine_sim.coolant_c))
+        ecu_ok = self.engine_sim.is_ecu_responding()
+        if self.dll is not None:
+            self.dll.set_temp_c(t_int)
+            self.dll.set_signal(ecu_ok)
+        else:
+            self.preview.temp_c = t_int
+            self.preview.signal_on = ecu_ok
+
     def _load_mode_locked(self, mode: str) -> None:
         self.mode = mode
-        self.serial_lines = []
-        self.can_lines = []
+        self.chat_feed = []
         if mode in self.dll_paths and self.dll_paths[mode].exists():
             self.dll = NativeDllWrapper(self.dll_paths[mode])
             self.dll.init()
-            self.dll.set_temp_c(self.temp_c)
-            self.dll.set_signal(self.signal_on)
+            self._sync_hw_inputs_locked()
             self.dll.tick(40)
             self.frame_bytes = self.dll.get_frame_bytes()
             self.gpio_mask = self.dll.get_gpio_mask()
-            self._append_serial_text(self.dll.pop_serial())
-            self._append_can_text(self.dll.pop_can_log())
+            self._ingest_serial_chunk(self.dll.pop_serial())
+            self._ingest_can_chunk(self.dll.pop_can_log())
         else:
             self.dll = None
             self.preview.reset(mode)
-            self.preview.temp_c = self.temp_c
-            self.preview.signal_on = self.signal_on
+            self._sync_hw_inputs_locked()
 
     def _loop(self) -> None:
         while self._running:
             with self.lock:
+                for lvl, ev_msg in self.engine_sim.step():
+                    self.emit_log("ECU_OBD", lvl, ev_msg)
+                self._sync_hw_inputs_locked()
+
                 if self.dll is not None:
                     self.dll.tick(40)
                     self.frame_bytes = self.dll.get_frame_bytes()
                     self.gpio_mask = self.dll.get_gpio_mask()
-                    self._append_serial_text(self.dll.pop_serial())
-                    self._append_can_text(self.dll.pop_can_log())
+                    self._ingest_serial_chunk(self.dll.pop_serial())
+                    self._ingest_can_chunk(self.dll.pop_can_log())
                 else:
                     self.preview.tick()
-            time.sleep(0.04)
+            time.sleep(0.05)
 
     def set_mode(self, mode: str) -> None:
         if mode not in ("sim", "obd"):
             return
         with self.lock:
-            log_line(LOG_COMPONENT, f"Cambio de modo -> {mode}")
+            self.emit_log("UI", "INFO", f"Modo cambiado -> {'OBD-II Vitara 2008' if mode == 'obd' else 'SIMULACIÓN Potenciómetro'}")
             self._load_mode_locked(mode)
 
     def reset_board(self) -> None:
         with self.lock:
-            log_line(LOG_COMPONENT, "Reset de ESP32-S3 virtual")
+            self.emit_log("UI", "INFO", "Reinicio de ESP32-S3 virtual")
             self._load_mode_locked(self.mode)
 
-    def set_inputs(self, temp_c: int | None, signal_on: bool | None) -> None:
+    def update_vehicle(self, body: dict[str, Any]) -> None:
         with self.lock:
-            if temp_c is not None:
-                self.temp_c = max(20, min(120, int(temp_c)))
-            if signal_on is not None:
-                self.signal_on = bool(signal_on)
-            if self.dll is not None:
-                self.dll.set_temp_c(self.temp_c)
-                self.dll.set_signal(self.signal_on)
-            else:
-                self.preview.temp_c = self.temp_c
-                self.preview.signal_on = self.signal_on
+            if "ignition" in body:
+                ign = str(body["ignition"])
+                if ign in ("OFF", "ACC_ON", "RUNNING"):
+                    self.engine_sim.ignition = ign
+                    self.emit_log("ECU_OBD", "INFO", f"Llave/Ignición -> {ign}")
+            if "profile" in body:
+                prof = str(body["profile"])
+                if prof in VitaraEngineSim.PROFILES:
+                    self.engine_sim.profile = prof
+                    self.engine_sim.auto_thermal = True
+                    self.emit_log("ECU_OBD", "INFO", f"Escenario Vitara -> {VitaraEngineSim.PROFILES[prof]['label']}")
+            if "obdConnected" in body:
+                self.engine_sim.obd_connected = bool(body["obdConnected"])
+                self.emit_log(
+                    "ECU_OBD",
+                    "INFO" if self.engine_sim.obd_connected else "WARN",
+                    "Cable OBD-II CONECTADO" if self.engine_sim.obd_connected else "Cable OBD-II DESCONECTADO (sin respuesta ECU)",
+                )
+            if "autoThermal" in body:
+                self.engine_sim.auto_thermal = bool(body["autoThermal"])
+                self.emit_log("ECU_OBD", "INFO", f"Calentamiento gradual automático -> {'ACTIVO' if self.engine_sim.auto_thermal else 'MANUAL'}")
+            if "tempC" in body and body["tempC"] is not None:
+                val = max(20.0, min(120.0, float(body["tempC"])))
+                self.engine_sim.coolant_c = val
+                self.engine_sim.auto_thermal = False
+                self.emit_log("ECU_OBD", "INFO", f"Temperatura manual fijada en {int(round(val))} °C")
+            if body.get("resetCold"):
+                self.engine_sim.reset_cold()
+                self.engine_sim.auto_thermal = True
+                self.emit_log("ECU_OBD", "INFO", "Motor enfriado a 28 °C (arranque en frío)")
+            self._sync_hw_inputs_locked()
 
     def pulse_button(self, pin: int) -> None:
         with self.lock:
             if self.dll is not None:
-                # Simula pulsacion fisica real superando el antirrebote de 45 ms en buttons.cpp
                 self.dll.set_button(pin, True)
                 self.dll.tick(25)
                 self.dll.tick(35)
@@ -428,8 +641,8 @@ class SimManager:
                 self.dll.tick(55)
                 self.frame_bytes = self.dll.get_frame_bytes()
                 self.gpio_mask = self.dll.get_gpio_mask()
-                self._append_serial_text(self.dll.pop_serial())
-                self._append_can_text(self.dll.pop_can_log())
+                self._ingest_serial_chunk(self.dll.pop_serial())
+                self._ingest_can_chunk(self.dll.pop_can_log())
             else:
                 self.preview.press_button(pin)
 
@@ -438,7 +651,11 @@ class SimManager:
             if self.dll is not None:
                 self.dll.trigger_bus_off()
             else:
-                self.preview.can_lines.append("[PREVIEW] BUS_OFF solo activo en motor C++ real.")
+                self.emit_log("ECU_OBD", "WARN", "BUS_OFF inducido (en motor C++ real prueba twai_initiate_recovery)")
+
+    def clear_logs(self) -> None:
+        with self.lock:
+            self.logs = []
 
     def get_state_dict(self) -> dict[str, Any]:
         with self.lock:
@@ -447,12 +664,10 @@ class SimManager:
                 "engine": "cpp" if is_cpp else "preview",
                 "compiler": self.compiler,
                 "mode": self.mode,
-                "tempC": self.temp_c,
-                "signalOn": self.signal_on,
+                "vehicle": self.engine_sim.to_dict(),
                 "gpioMask": self.gpio_mask,
-                "serialLines": self.serial_lines if is_cpp else self.preview.serial_lines,
-                "canLines": self.can_lines if is_cpp else self.preview.can_lines,
-                "buildLog": self.build_log,
+                "logs": self.logs[-250:],
+                "chatFeed": self.chat_feed[-20:] if is_cpp else self.preview.chat_messages[-20:],
                 "buildError": self.build_error,
                 "preview": None if is_cpp else self.preview.snapshot(),
             }
@@ -467,7 +682,7 @@ SIM = SimManager()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
-        return  # Silencia spam HTTP en consola
+        return
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -518,18 +733,17 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
 
         if path == "/api/button":
-            pin = int(body.get("pin", -1))
-            SIM.pulse_button(pin)
+            SIM.pulse_button(int(body.get("pin", -1)))
             self._send_json({"ok": True})
             return
 
-        if path == "/api/inputs":
-            SIM.set_inputs(body.get("tempC"), body.get("signalOn"))
+        if path == "/api/vehicle":
+            SIM.update_vehicle(body)
             self._send_json({"ok": True})
             return
 
         if path == "/api/mode":
-            SIM.set_mode(str(body.get("mode", "sim")))
+            SIM.set_mode(str(body.get("mode", "obd")))
             self._send_json({"ok": True})
             return
 
@@ -540,6 +754,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/busoff":
             SIM.trigger_bus_off()
+            self._send_json({"ok": True})
+            return
+
+        if path == "/api/logs/clear":
+            SIM.clear_logs()
             self._send_json({"ok": True})
             return
 

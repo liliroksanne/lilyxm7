@@ -1,10 +1,47 @@
 #include "assistant_ascii.h"
 #include "config.h"
+#include <Arduino.h>
 #include <stdio.h>
+#include <string.h>
 
 namespace {
 
-char g_dynamicLine2[48];
+ChatMessage g_chatHistory[CHAT_MAX_MESSAGES];
+uint8_t g_chatCount = 0;
+uint32_t g_chatVersion = 0;
+
+bool g_hasInitialized = false;
+ScreenId g_prevScreen = ScreenId::MAIN_MENU;
+AssistantMood g_prevMood = AssistantMood::MENU_IDLE;
+bool g_prevLiveSignal = false;
+int16_t g_lastAnnouncedTemp = -999;
+char g_trendBuf[48];
+
+void pushChatMessage(const char* msg, bool isAlert) {
+  if (!msg || msg[0] == '\0') {
+    return;
+  }
+
+  // Evita duplicar exactamente el último mensaje consecutivo
+  if (g_chatCount > 0 && strcmp(g_chatHistory[g_chatCount - 1].text, msg) == 0) {
+    return;
+  }
+
+  if (g_chatCount < CHAT_MAX_MESSAGES) {
+    snprintf(g_chatHistory[g_chatCount].text, CHAT_MSG_MAX_LEN, "%s", msg);
+    g_chatHistory[g_chatCount].isAlert = isAlert;
+    g_chatCount++;
+  } else {
+    for (uint8_t i = 1; i < CHAT_MAX_MESSAGES; ++i) {
+      g_chatHistory[i - 1] = g_chatHistory[i];
+    }
+    snprintf(g_chatHistory[CHAT_MAX_MESSAGES - 1].text, CHAT_MSG_MAX_LEN, "%s", msg);
+    g_chatHistory[CHAT_MAX_MESSAGES - 1].isAlert = isAlert;
+  }
+
+  g_chatVersion++;
+  Serial.printf("[LOG][CHAT] LILY: %s\n", msg);
+}
 
 AssistantMood moodFromTemperature(const TempReading& reading) {
   if (!reading.hasLiveSignal) {
@@ -25,213 +62,184 @@ AssistantMood moodFromTemperature(const TempReading& reading) {
   return AssistantMood::OVERHEAT;
 }
 
+const char* moodToTag(AssistantMood mood) {
+  switch (mood) {
+    case AssistantMood::MENU_IDLE:  return "EN LINEA";
+    case AssistantMood::COLD:       return "MOTOR FRIO";
+    case AssistantMood::WARMING:    return "CALENTANDO";
+    case AssistantMood::OPTIMAL:    return "OPTIMO";
+    case AssistantMood::WARM_WARN:  return "TEMP ALTA";
+    case AssistantMood::OVERHEAT:   return "PELIGRO!";
+    case AssistantMood::NO_SIGNAL:
+    default:                        return "SIN SENAL";
+  }
+}
+
 void formatTrendNote(const TempReading& reading, char* buf, size_t len) {
   if (!reading.hasLiveSignal) {
     if (reading.hasLastValue) {
-      snprintf(buf, len, "Conservando última: %d°C", reading.tempC);
+      snprintf(buf, len, "Última lectura: %d°C", reading.tempC);
     } else {
-      snprintf(buf, len, "Revisa ignición o cable OBD");
+      snprintf(buf, len, "Esperando ECU 01 05");
     }
     return;
   }
 
   switch (reading.trend) {
     case TempTrend::TREND_UP:
-      snprintf(buf, len, "Subió +%d°C desde %d°C", reading.deltaC, reading.previousTempC);
+      snprintf(buf, len, "Subió +%d°C (de %d°C)", reading.deltaC, reading.previousTempC);
       break;
     case TempTrend::TREND_DOWN:
-      snprintf(buf, len, "Bajó %d°C desde %d°C", reading.deltaC, reading.previousTempC);
+      snprintf(buf, len, "Bajó %d°C (de %d°C)", reading.deltaC, reading.previousTempC);
       break;
     case TempTrend::TREND_STABLE:
-      snprintf(buf, len, "Estable respecto a %d°C", reading.previousTempC);
+      snprintf(buf, len, "Estable en %d°C", reading.tempC);
       break;
     case TempTrend::TREND_NONE:
     default:
-      snprintf(buf, len, "Primera lectura válida");
+      snprintf(buf, len, "Primera lectura: %d°C", reading.tempC);
       break;
   }
 }
 
 } // namespace
 
-AssistantState computeAssistantState(ScreenId screen, const TempReading& reading) {
+void assistantChatInit(bool isSimulated) {
+  g_chatCount = 0;
+  g_chatVersion = 0;
+  g_hasInitialized = true;
+  g_prevScreen = ScreenId::MAIN_MENU;
+  g_prevMood = AssistantMood::MENU_IDLE;
+  g_prevLiveSignal = false;
+  g_lastAnnouncedTemp = -999;
+
+  pushChatMessage("Hola! Soy Lily v1.0.", false);
+  if (isSimulated) {
+    pushChatMessage("Modo SIMULACIÓN activo.", false);
+  } else {
+    pushChatMessage("Lista p/ Vitara 2.7L.", false);
+  }
+}
+
+AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) {
+  if (!g_hasInitialized) {
+    assistantChatInit(reading.isSimulated);
+  }
+
   AssistantState st{};
+  formatTrendNote(reading, g_trendBuf, sizeof(g_trendBuf));
+  st.trendLine = g_trendBuf;
 
-  if (screen == ScreenId::MAIN_MENU) {
-    st.mood = reading.hasLiveSignal ? AssistantMood::MENU_IDLE : AssistantMood::NO_SIGNAL;
-    st.moodTag = reading.hasLiveSignal ? "EN LINEA" : "EN ESPERA";
-    st.line1 = reading.isSimulated
-                   ? "Modo simulación listo."
-                   : "Lista para la Vitara.";
-    st.line2 = "Usa ↑/↓ y A para entrar.";
-    st.isAlert = false;
-    return st;
-  }
+  const AssistantMood tempMood = moodFromTemperature(reading);
+  const bool screenChanged = (screen != g_prevScreen);
 
-  if (screen == ScreenId::CONNECTION_STATUS) {
-    if (reading.hasLiveSignal) {
-      st.mood = AssistantMood::OPTIMAL;
-      st.moodTag = "ENLACE OK";
-      st.line1 = reading.isSimulated
-                     ? "Enlace virtual activo."
-                     : "ECU respondiendo 01 05.";
-      st.line2 = "Pulsa B para volver.";
-      st.isAlert = false;
+  if (screenChanged) {
+    if (screen == ScreenId::TEMPERATURE) {
+      pushChatMessage("Abriendo Temperatura...", false);
+    } else if (screen == ScreenId::CONNECTION_STATUS) {
+      pushChatMessage("Revisando enlace ECU.", false);
     } else {
-      st.mood = AssistantMood::NO_SIGNAL;
-      st.moodTag = "SIN SENAL";
-      st.line1 = "Sin datos del auto.";
-      st.line2 = reading.hasLastValue
-                     ? "Última lectura guardada."
-                     : "Esperando respuesta ECU.";
-      st.isAlert = true;
+      pushChatMessage("Menú principal listo.", false);
     }
-    return st;
+    g_prevScreen = screen;
   }
 
-  // Pantalla principal de Temperatura en vivo
-  st.mood = moodFromTemperature(reading);
-  formatTrendNote(reading, g_dynamicLine2, sizeof(g_dynamicLine2));
-  st.line2 = g_dynamicLine2;
+  // Detectar pérdida o recuperación de señal
+  if (!reading.hasLiveSignal && g_prevLiveSignal) {
+    char buf[CHAT_MSG_MAX_LEN];
+    pushChatMessage("Sin datos del auto!", true);
+    if (reading.hasLastValue) {
+      snprintf(buf, sizeof(buf), "Última lectura: %d°C", reading.tempC);
+      pushChatMessage(buf, true);
+    }
+    g_prevLiveSignal = false;
+    g_prevMood = AssistantMood::NO_SIGNAL;
+  } else if (reading.hasLiveSignal) {
+    const bool recovered = !g_prevLiveSignal;
+    g_prevLiveSignal = true;
 
-  switch (st.mood) {
-    case AssistantMood::COLD:
-      st.moodTag = "MOTOR FRIO";
-      st.isAlert = false;
-      if (reading.trend == TempTrend::TREND_UP) {
-        st.line1 = "Subiendo, buen arranque.";
-      } else if (reading.trend == TempTrend::TREND_DOWN) {
-        st.line1 = "Bajó, motor aún frío.";
+    const bool moodChanged = (tempMood != g_prevMood);
+    const int16_t stepDelta = (g_lastAnnouncedTemp == -999)
+                                  ? 99
+                                  : static_cast<int16_t>(reading.tempC - g_lastAnnouncedTemp);
+    const bool bigStep = (stepDelta >= 3 || stepDelta <= -3);
+
+    if (recovered || moodChanged || bigStep) {
+      char msg[CHAT_MSG_MAX_LEN];
+      if (recovered && g_lastAnnouncedTemp != -999) {
+        snprintf(msg, sizeof(msg), "Señal OK! Ahora %d°C", reading.tempC);
+        pushChatMessage(msg, false);
       } else {
-        st.line1 = "Motor frío, acelera suave.";
-      }
-      break;
+        switch (tempMood) {
+          case AssistantMood::COLD:
+            if (reading.trend == TempTrend::TREND_UP) {
+              snprintf(msg, sizeof(msg), "Subió a %d°C, calent.", reading.tempC);
+            } else {
+              snprintf(msg, sizeof(msg), "Motor frío: %d°C.", reading.tempC);
+            }
+            pushChatMessage(msg, false);
+            break;
 
-    case AssistantMood::WARMING:
-      st.moodTag = "CALENTANDO";
-      st.isAlert = false;
-      if (reading.trend == TempTrend::TREND_UP) {
-        st.line1 = "Subiendo a punto ideal.";
-      } else if (reading.trend == TempTrend::TREND_DOWN) {
-        st.line1 = "Bajó un poco, atenta.";
-      } else {
-        st.line1 = "Tomando temperatura.";
-      }
-      break;
+          case AssistantMood::WARMING:
+            if (reading.trend == TempTrend::TREND_UP) {
+              snprintf(msg, sizeof(msg), "Calentando: %d°C (+)", reading.tempC);
+            } else if (reading.trend == TempTrend::TREND_DOWN) {
+              snprintf(msg, sizeof(msg), "Bajó a %d°C, atenta.", reading.tempC);
+            } else {
+              snprintf(msg, sizeof(msg), "Tomando temp: %d°C.", reading.tempC);
+            }
+            pushChatMessage(msg, false);
+            break;
 
-    case AssistantMood::OPTIMAL:
-      st.moodTag = "OPTIMO";
-      st.isAlert = false;
-      if (reading.trend == TempTrend::TREND_UP) {
-        st.line1 = "Subió, pero sigue ideal.";
-      } else if (reading.trend == TempTrend::TREND_DOWN) {
-        st.line1 = "Bajó, todo bajo control.";
-      } else {
-        st.line1 = "Vitara en temp óptima.";
-      }
-      break;
+          case AssistantMood::OPTIMAL:
+            if (moodChanged) {
+              snprintf(msg, sizeof(msg), "%d°C! Temp óptima :)", reading.tempC);
+            } else if (reading.trend == TempTrend::TREND_UP) {
+              snprintf(msg, sizeof(msg), "Subió a %d°C (ideal).", reading.tempC);
+            } else {
+              snprintf(msg, sizeof(msg), "Bajó a %d°C (ideal).", reading.tempC);
+            }
+            pushChatMessage(msg, false);
+            break;
 
-    case AssistantMood::WARM_WARN:
-      st.moodTag = "TEMP ALTA";
-      st.isAlert = true;
-      if (reading.trend == TempTrend::TREND_UP) {
-        st.line1 = "¡Subió! Vigila el motor.";
-      } else if (reading.trend == TempTrend::TREND_DOWN) {
-        st.line1 = "Está bajando, bien.";
-      } else {
-        st.line1 = "Temperatura alta, alerta.";
-      }
-      break;
+          case AssistantMood::WARM_WARN:
+            snprintf(msg, sizeof(msg), "Ojo! Temp alta: %d°C", reading.tempC);
+            pushChatMessage(msg, true);
+            break;
 
-    case AssistantMood::OVERHEAT:
-      st.moodTag = "PELIGRO!";
-      st.isAlert = true;
-      if (reading.trend == TempTrend::TREND_UP) {
-        st.line1 = "¡ALERTA! Sigue subiendo.";
-      } else if (reading.trend == TempTrend::TREND_DOWN) {
-        st.line1 = "Aún crítica, detente.";
-      } else {
-        st.line1 = "¡PELIGRO! Sobrecalent.";
-      }
-      break;
+          case AssistantMood::OVERHEAT:
+            snprintf(msg, sizeof(msg), "ALERTA! %d°C detente!", reading.tempC);
+            pushChatMessage(msg, true);
+            break;
 
-    case AssistantMood::NO_SIGNAL:
-    default:
-      st.moodTag = "SIN SENAL";
-      st.isAlert = true;
-      st.line1 = reading.hasLastValue
-                     ? "Sin datos. Guarde última."
-                     : "Sin datos del auto...";
-      break;
+          default:
+            break;
+        }
+      }
+      g_lastAnnouncedTemp = reading.tempC;
+      g_prevMood = tempMood;
+    }
   }
 
+  st.mood = (screen == ScreenId::MAIN_MENU && reading.hasLiveSignal)
+                ? AssistantMood::MENU_IDLE
+                : tempMood;
+  st.moodTag = moodToTag(st.mood);
+  st.isAlert = (st.mood == AssistantMood::WARM_WARN ||
+                st.mood == AssistantMood::OVERHEAT ||
+                st.mood == AssistantMood::NO_SIGNAL);
+  st.latestLine = (g_chatCount > 0) ? g_chatHistory[g_chatCount - 1].text : "Lista.";
+  st.chatVersion = g_chatVersion;
   return st;
 }
 
-void getAssistantAsciiLines(AssistantMood mood, bool blinkClosed, const char* outLines[ASCII_ART_LINES]) {
-  // Base común de cabello y silueta cyberpunk Matrix (21 caracteres de ancho máx.)
-  outLines[0]  = "   .---=======---.   ";
-  outLines[1]  = "  / .-/|||||||\\-. \\  ";
-  outLines[2]  = " | / /  _   _  \\ \\ | ";
+uint8_t getChatMessageCount() {
+  return g_chatCount;
+}
 
-  // Líneas 3..6 cambian según la expresión controlada por código
-  switch (mood) {
-    case AssistantMood::MENU_IDLE:
-      outLines[3] = blinkClosed ? " || |  -     -  | || " : " || |  ^     ^  | || ";
-      outLines[4] = " || |     .     | || ";
-      outLines[5] = " | \\ \\   \\_/   / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
-
-    case AssistantMood::COLD:
-      outLines[3] = blinkClosed ? " || |  -     -  | || " : " || |  >     <  | || ";
-      outLines[4] = " || |     .     | || ";
-      outLines[5] = " | \\ \\   ~~~   / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
-
-    case AssistantMood::WARMING:
-      outLines[3] = blinkClosed ? " || |  -     -  | || " : " || |  o     o  | || ";
-      outLines[4] = " || |     .     | || ";
-      outLines[5] = " | \\ \\    v    / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
-
-    case AssistantMood::OPTIMAL:
-      outLines[3] = blinkClosed ? " || |  -     -  | || " : " || |  ^     ^  | || ";
-      outLines[4] = " || |   * . *   | || ";
-      outLines[5] = " | \\ \\  \\___/  / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
-
-    case AssistantMood::WARM_WARN:
-      outLines[3] = blinkClosed ? " || |  -    -'  | || " : " || |  O    O'  | || ";
-      outLines[4] = " || |     .     | || ";
-      outLines[5] = " | \\ \\    o    / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
-
-    case AssistantMood::OVERHEAT:
-      outLines[0] = " ! .---=======---. ! ";
-      outLines[3] = blinkClosed ? " || |  >     <  | || " : " || |  X     X  | || ";
-      outLines[4] = " || |     !     | || ";
-      outLines[5] = " | \\ \\   ===   / / | ";
-      outLines[6] = " !  \\ '-------' /  ! ";
-      break;
-
-    case AssistantMood::NO_SIGNAL:
-    default:
-      outLines[3] = blinkClosed ? " || |  -     -  | || " : " || |  ?     ?  | || ";
-      outLines[4] = " || |     .     | || ";
-      outLines[5] = " | \\ \\   ___   / / | ";
-      outLines[6] = " |  \\ '-------' /  | ";
-      break;
+const ChatMessage& getChatMessage(uint8_t index) {
+  if (index >= g_chatCount) {
+    return g_chatHistory[0];
   }
-
-  // Hombros / collar Matrix
-  outLines[7]  = " |   '.__   __.'   | ";
-  outLines[8]  = " |  .--/ | | \\--.  | ";
-  outLines[9]  = " \\_/  | [010] |  \\_/ ";
-  outLines[10] = "      |  ___  |      ";
-  outLines[11] = "     /  /   \\  \\     ";
+  return g_chatHistory[index];
 }

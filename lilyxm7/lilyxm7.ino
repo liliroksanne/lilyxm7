@@ -11,6 +11,7 @@
 #include "data_types.h"
 #include "buttons.h"
 #include "data_source.h"
+#include "assistant_ascii.h"
 #include "ui_tft.h"
 
 namespace {
@@ -74,6 +75,7 @@ void setup() {
 
   buttonsInit();
   dataSourceInit();
+  assistantChatInit(isSimulationMode());
   uiInit();
 }
 

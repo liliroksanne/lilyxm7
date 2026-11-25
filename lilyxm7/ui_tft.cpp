@@ -33,7 +33,7 @@ int16_t g_lastTempC = -999;
 TempTrend g_lastTrend = TempTrend::TREND_NONE;
 uint32_t g_lastValidCount = 0;
 uint32_t g_lastConnSec = 999999;
-bool g_lastBlinkClosed = false;
+uint32_t g_lastChatVersion = 0;
 uint8_t g_animTick = 0;
 uint32_t g_lastAnimMs = 0;
 
@@ -150,15 +150,15 @@ void drawDialogueBox(const AssistantState& st) {
   g_tft.drawRect(bx, by, bw, bh, st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_DIM);
 
   g_tft.setCursor(bx + 6, by + 6);
-  printEs("> LILY: ", COLOR_MATRIX_MID, 1);
-  printEs(st.line1, st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT, 1);
+  printEs("LILY> ", COLOR_MATRIX_MID, 1);
+  printEs(st.latestLine, st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT, 1);
 
   g_tft.setCursor(bx + 6, by + 20);
-  printEs("  ", COLOR_MATRIX_DIM, 1);
-  printEs(st.line2, COLOR_MATRIX_MID, 1);
+  printEs("INFO> ", COLOR_MATRIX_DIM, 1);
+  printEs(st.trendLine, COLOR_MATRIX_MID, 1);
 }
 
-void drawAssistantPanel(const AssistantState& st, bool blinkClosed, uint8_t animTick) {
+void drawChatPanel(const AssistantState& st, uint8_t animTick) {
   constexpr int16_t px = 4;
   constexpr int16_t py = 26;
   constexpr int16_t pw = 144;
@@ -167,30 +167,54 @@ void drawAssistantPanel(const AssistantState& st, bool blinkClosed, uint8_t anim
   g_tft.fillRect(px, py, pw, ph, COLOR_BG);
   g_tft.drawRect(px, py, pw, ph, st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_DIM);
 
-  // Tira sutil de bits Matrix en la cabecera del panel
-  g_tft.setCursor(px + 6, py + 4);
-  const char* rainHeader = (animTick & 1) ? "01 10 LILY.ASCII 01" : "10 01 LILY.ASCII 10";
-  printEs(rainHeader, COLOR_MATRIX_DARK, 1);
+  // Encabezado del chatbot Matrix
+  g_tft.setCursor(px + 6, py + 6);
+  printEs("CHAT // LILY", COLOR_MATRIX_BRIGHT, 1);
+  g_tft.setCursor(px + pw - 16, py + 6);
+  printEs((animTick & 1) ? "*" : "o", COLOR_MATRIX_MID, 1);
+  g_tft.drawFastHLine(px + 4, py + 17, pw - 8, COLOR_MATRIX_DARK);
 
-  const char* lines[ASCII_ART_LINES];
-  getAssistantAsciiLines(st.mood, blinkClosed, lines);
+  // Mensajes tipo burbuja de chatbot (hasta 5 visibles en el panel izquierdo)
+  const uint8_t total = getChatMessageCount();
+  const uint8_t maxVisible = 5;
+  const uint8_t startIdx = (total > maxVisible) ? static_cast<uint8_t>(total - maxVisible) : 0;
 
-  for (uint8_t i = 0; i < ASCII_ART_LINES; ++i) {
-    uint16_t lineColor = COLOR_MATRIX_MID;
-    if (i >= 3 && i <= 6) {
-      // Rostro y expresión en verde neón brillante
-      lineColor = st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT;
-    } else if (i == 9) {
-      // Badge binario del pecho
-      lineColor = COLOR_MATRIX_BRIGHT;
+  int16_t y = py + 23;
+  for (uint8_t i = startIdx; i < total; ++i) {
+    const ChatMessage& m = getChatMessage(i);
+    const bool isNewest = (i == total - 1);
+    const uint16_t boxColor = isNewest
+                                  ? (m.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT)
+                                  : COLOR_MATRIX_DARK;
+    const uint16_t txtColor = isNewest
+                                  ? (m.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT)
+                                  : COLOR_MATRIX_MID;
+
+    // Burbuja compacta (20 px alto, hasta 20 caracteres visibles sin cortar UTF-8)
+    g_tft.drawRect(px + 5, y, pw - 10, 20, boxColor);
+    char clipped[36];
+    size_t srcIdx = 0;
+    size_t dstIdx = 0;
+    uint8_t glyphs = 0;
+    while (m.text[srcIdx] != '\0' && glyphs < 20 && dstIdx < sizeof(clipped) - 4) {
+      const uint8_t b = static_cast<uint8_t>(m.text[srcIdx]);
+      size_t seqLen = 1;
+      if ((b & 0xE0) == 0xC0) seqLen = 2;
+      else if ((b & 0xF0) == 0xE0) seqLen = 3;
+      for (size_t k = 0; k < seqLen && m.text[srcIdx] != '\0'; ++k) {
+        clipped[dstIdx++] = m.text[srcIdx++];
+      }
+      glyphs++;
     }
-    g_tft.setCursor(px + 9, py + 18 + (i * 9));
-    printEs(lines[i], lineColor, 1);
+    clipped[dstIdx] = '\0';
+    g_tft.setCursor(px + 9, y + 6);
+    printEs(clipped, txtColor, 1);
+    y += 23;
   }
 
-  // Etiqueta de estado emocional al pie del retrato
+  // Etiqueta de estado al pie del panel de chat
   g_tft.drawFastHLine(px + 4, py + ph - 18, pw - 8, COLOR_MATRIX_DARK);
-  g_tft.setCursor(px + 10, py + ph - 13);
+  g_tft.setCursor(px + 8, py + ph - 13);
   printEs("ESTADO: ", COLOR_MATRIX_DIM, 1);
   printEs(st.moodTag, st.isAlert ? COLOR_MATRIX_GLOW : COLOR_MATRIX_BRIGHT, 1);
 }
@@ -451,14 +475,15 @@ void uiRender(ScreenId screen,
               const ConnectionInfo& connInfo) {
   const uint32_t now = millis();
 
-  // Parpadeo suave de la asistente ASCII (cierra ojos brevemente 1 de cada 8 ticks)
+  // Pulso sutil del indicador del chatbot
   bool animChanged = false;
   if ((now - g_lastAnimMs) >= UI_ANIMATION_INTERVAL_MS) {
     g_lastAnimMs = now;
     g_animTick++;
     animChanged = true;
   }
-  const bool blinkClosed = ((g_animTick % 8) == 7);
+
+  const AssistantState assistant = updateAssistantChat(screen, tempReading);
 
   const uint32_t connAgeSec =
       (connInfo.hasLastValue && connInfo.nowMs >= connInfo.lastValidMs)
@@ -473,15 +498,13 @@ void uiRender(ScreenId screen,
       (tempReading.tempC != g_lastTempC) ||
       (tempReading.trend != g_lastTrend) ||
       (tempReading.validCount != g_lastValidCount);
+  const bool chatChanged = (assistant.chatVersion != g_lastChatVersion);
   const bool connTimeChanged = (screen == ScreenId::CONNECTION_STATUS && connAgeSec != g_lastConnSec);
-  const bool blinkChanged = (blinkClosed != g_lastBlinkClosed);
 
   if (!g_needFullRedraw && !screenChanged && !menuChanged && !dataChanged &&
-      !connTimeChanged && !blinkChanged && !animChanged) {
+      !connTimeChanged && !chatChanged && !animChanged) {
     return;
   }
-
-  const AssistantState assistant = computeAssistantState(screen, tempReading);
 
   if (g_needFullRedraw || screenChanged) {
     g_tft.fillScreen(COLOR_BG);
@@ -498,9 +521,9 @@ void uiRender(ScreenId screen,
     drawTopBar(title, tempReading.isSimulated, tempReading.hasLiveSignal);
   }
 
-  // Panel izquierdo: chica ASCII Matrix
-  if (g_needFullRedraw || screenChanged || dataChanged || blinkChanged || animChanged) {
-    drawAssistantPanel(assistant, blinkClosed, g_animTick);
+  // Panel izquierdo: Chatbot simple Matrix
+  if (g_needFullRedraw || screenChanged || dataChanged || chatChanged || animChanged) {
+    drawChatPanel(assistant, g_animTick);
   }
 
   // Panel derecho según pantalla activa
@@ -518,8 +541,8 @@ void uiRender(ScreenId screen,
     }
   }
 
-  // Caja de diálogo de Lily
-  if (g_needFullRedraw || screenChanged || dataChanged) {
+  // Caja de último mensaje / tendencia
+  if (g_needFullRedraw || screenChanged || dataChanged || chatChanged) {
     drawDialogueBox(assistant);
   }
 
@@ -541,5 +564,5 @@ void uiRender(ScreenId screen,
   g_lastTrend = tempReading.trend;
   g_lastValidCount = tempReading.validCount;
   g_lastConnSec = connAgeSec;
-  g_lastBlinkClosed = blinkClosed;
+  g_lastChatVersion = assistant.chatVersion;
 }
