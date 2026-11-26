@@ -3,6 +3,8 @@
 // para Windows y expone una API C simple que consume sim_web/server.py.
 // ============================================================================
 
+#define LILYXM7_NATIVE_SIM 1
+
 #include "Arduino.h"
 #include "SPI.h"
 #include "Adafruit_GFX.h"
@@ -340,7 +342,12 @@ SIM_EXPORT void sim_tick(uint32_t dt_ms) {
 }
 
 SIM_EXPORT void sim_set_button(int pin, int pressed) {
-  sim_hw::setDigitalInput(pin, pressed ? LOW : HIGH);
+  int mapped = pin;
+  if (pin == 4) mapped = PIN_BTN_UP;
+  else if (pin == 5) mapped = PIN_BTN_DOWN;
+  else if (pin == 6) mapped = PIN_BTN_A;
+  else if (pin == 7) mapped = PIN_BTN_B;
+  sim_hw::setDigitalInput(mapped, pressed ? LOW : HIGH);
 }
 
 SIM_EXPORT void sim_set_temp_c(int temp_c) {

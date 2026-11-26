@@ -6,7 +6,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+#include "st7789_tft.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -23,7 +23,7 @@ constexpr uint16_t COLOR_MATRIX_GLOW    = 0xFE1C; // Rosa claro (destello / aler
 constexpr int16_t SCREEN_W = 320;
 constexpr int16_t SCREEN_H = 240;
 
-Adafruit_ILI9341 g_tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
+St7789Tft g_tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 
 // Caché de estado para redibujar solo lo que cambia y evitar parpadeos
 bool g_needFullRedraw = true;

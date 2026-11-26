@@ -48,7 +48,9 @@ void pushChatMessage(const char* msg, bool isAlert) {
   g_chatVersion++;
   g_eyeStartedMs = millis();
   g_eyeDurationMs = isAlert ? 1100 : 450;
-  digitalWrite(PIN_LILY_EYE, HIGH);
+  if (PIN_LILY_EYE >= 0) {
+    digitalWrite(PIN_LILY_EYE, HIGH);
+  }
   Serial.printf("[LOG][CHAT] LILY: %s\n", msg);
 }
 
@@ -119,8 +121,10 @@ void assistantChatInit(bool isSimulated) {
   g_eyeDurationMs = 0;
   g_lastMil = -1;
   g_lastStoredCount = -1;
-  pinMode(PIN_LILY_EYE, OUTPUT);
-  digitalWrite(PIN_LILY_EYE, LOW);
+  if (PIN_LILY_EYE >= 0) {
+    pinMode(PIN_LILY_EYE, OUTPUT);
+    digitalWrite(PIN_LILY_EYE, LOW);
+  }
   g_hasInitialized = true;
   g_prevScreen = ScreenId::MAIN_MENU;
   g_prevMood = AssistantMood::MENU_IDLE;
@@ -142,7 +146,9 @@ AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading) 
 
   if (g_eyeDurationMs && millis() - g_eyeStartedMs >= g_eyeDurationMs) {
     g_eyeDurationMs = 0;
-    digitalWrite(PIN_LILY_EYE, LOW);
+    if (PIN_LILY_EYE >= 0) {
+      digitalWrite(PIN_LILY_EYE, LOW);
+    }
   }
 
   AssistantState st{};

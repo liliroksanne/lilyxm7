@@ -1,5 +1,10 @@
 # lilyxm7 — Escáner OBD-II para Suzuki Grand Vitara 2008 V6 2.7 L
 
+COMANDOS 
+
+cargar_placa.bat COM3 -ArduinoData "C:\Users\LilianaRoksanneDíaz\AppData\Local\Arduino15" -PruebaPantalla
+
+
 **`lilyxm7`** es un escáner OBD-II programado en **C++ (Arduino IDE)** para **ESP32-S3** pensado específicamente para la **Suzuki Grand Vitara 2008 V6 2.7 L** (motor N27A, protocolo **ISO 15765-4 CAN 11-bit a 500 kbps**).
 
 La primera versión (**v1.0**) lee en vivo la **temperatura del refrigerante** (`Servicio 01, PID 05`), la muestra en una **pantalla física TFT 2.4" (ILI9341)** con estética **Matrix verde sobre negro**, se navega con **4 botones físicos (`↑`, `↓`, `A`, `B`)** e incluye a **Lily**, una asistente tipo **chatbot simple** que envía mensajes breves según lo que ocurre con el motor y la señal del vehículo.

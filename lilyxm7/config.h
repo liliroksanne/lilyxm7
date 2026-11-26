@@ -18,35 +18,38 @@
 #define LILYXM7_VEHICLE_LABEL "VITARA 2.7"
 
 // ============================================================================
-// Pines ESP32-S3 (compatibles con LAFVIN ESP32-S3 y Wokwi DevKitC-1)
-// Evita pines strapping (0, 3, 45, 46), USB nativo (19, 20) y PSRAM (33-37).
+// Pines ESP32-S3 para placa LAFVIN "Retro Game Emulator" (esp32-s3-devkit)
+// Fuente oficial: lafvintech/LAFVIN-Retro-Game-Kit (branch dev, config.h)
 // ============================================================================
 
-// Pantalla TFT 2.4" ILI9341 (SPI hardware)
-constexpr int PIN_TFT_CS   = 10;
-constexpr int PIN_TFT_DC   = 9;
-constexpr int PIN_TFT_RST  = 14;
-constexpr int PIN_TFT_MOSI = 11;
-constexpr int PIN_TFT_SCK  = 12;
-constexpr int PIN_TFT_MISO = 13;
-constexpr int PIN_TFT_BL   = 21; // Opcional: se pone en HIGH al iniciar
+// Pantalla TFT ST7789 240x320 soldada en la placa Retro Game Emulator (SPI2)
+constexpr int PIN_TFT_BL   = 6;   // Backlight
+constexpr int PIN_TFT_CS   = 7;   // Chip Select
+constexpr int PIN_TFT_DC   = 15;  // Data / Command (RS)
+constexpr int PIN_TFT_RST  = 16;  // Reset
+constexpr int PIN_TFT_MOSI = 17;  // SDA / MOSI
+constexpr int PIN_TFT_SCK  = 18;  // SCL / SCK
+constexpr int PIN_TFT_MISO = -1;  // No conectado en la placa
 
-// Botones físicos del menú (conectados entre GPIO y GND, usando INPUT_PULLUP)
-constexpr int PIN_BTN_UP   = 4;  // Flecha arriba (↑)
-constexpr int PIN_BTN_DOWN = 5;  // Flecha abajo (↓)
-constexpr int PIN_BTN_A    = 6;  // Botón A (Seleccionar)
-constexpr int PIN_BTN_B    = 7;  // Botón B (Volver)
+// Botones físicos soldados en la placa Retro Game Emulator (INPUT_PULLUP, activo LOW)
+// Otros disponibles en la placa: LEFT=13, RIGHT=14, START=39, SELECT=40, MENU=5, OPTION=4
+constexpr int PIN_BTN_UP   = 11;  // Botón UP (↑)
+constexpr int PIN_BTN_DOWN = 12;  // Botón DOWN (↓)
+constexpr int PIN_BTN_A    = 21;  // Botón SW-A (Seleccionar)
+constexpr int PIN_BTN_B    = 47;  // Botón SW-B (Volver)
 
-// LED indicador de actividad de Lily (activo HIGH, con resistencia serie).
-constexpr int PIN_LILY_EYE = 16;
+// LED indicador externo opcional (poner en -1 si no se conecta; GPIO 16 lo usa TFT_RST)
+constexpr int PIN_LILY_EYE = -1;
 
-// Entradas de simulación para Wokwi (solo activas cuando LILYXM7_SIMULATION_MODE == 1)
-constexpr int PIN_SIM_POT        = 1; // Potenciómetro de temperatura (ADC1_CH0)
-constexpr int PIN_SIM_SIGNAL_SW  = 2; // Switch de señal: LOW = ECU responde, HIGH = sin señal
+// Entradas de simulación para banco/simulador (solo cuando LILYXM7_SIMULATION_MODE == 1)
+// Nota: GPIO 1 y 2 son CS/CLK del TFCard si montas el módulo microSD
+constexpr int PIN_SIM_POT        = 1;
+constexpr int PIN_SIM_SIGNAL_SW  = 2;
 
 // Bus CAN / TWAI hacia transceptor SN65HVD230 (solo cuando LILYXM7_SIMULATION_MODE == 0)
-constexpr int PIN_CAN_TX = 17; // Conectar a CTX (D) del SN65HVD230
-constexpr int PIN_CAN_RX = 18; // Conectar a CRX (R) del SN65HVD230
+// GPIOs libres en la placa Retro Game Emulator (sin choque con TFT, botones ni SD):
+constexpr int PIN_CAN_TX = 38; // Conectar a CTX (D) del SN65HVD230
+constexpr int PIN_CAN_RX = 8;  // Conectar a CRX (R) del SN65HVD230
 
 // ============================================================================
 // Temporizaciones y parámetros de operación
