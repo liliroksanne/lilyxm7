@@ -120,7 +120,39 @@ static void testTempTrackerTrendsAndSignalLoss() {
   assert(tracker.reading().trend == TempTrend::TREND_UP);
 }
 
+void testStoredDtcTransport() {
+  using Result = obd::StoredDtcResponse::Result;
+  obd::StoredDtcResponse response;
+  const auto request = obd::buildRequest(0x03);
+  assert(request.id == 0x7DF && request.data[0] == 1 && request.data[1] == 3);
+  const obd::CanFrame noCodes{0x7E8, 8, {0x02, 0x43, 0x00}};
+  assert(response.accept(noCodes) == Result::COMPLETE && response.count() == 0);
+
+  const obd::CanFrame single{0x7E8, 8, {0x04, 0x43, 0x01, 0x03, 0x00}};
+  assert(response.accept(single) == Result::COMPLETE);
+  char text[6];
+  obd::formatDtc(response.code(0), text);
+  assert(text[0] == 'P' && text[1] == '0' && text[2] == '3' && text[3] == '0' && text[4] == '0');
+
+  const obd::CanFrame first{0x7E8, 8, {0x10, 0x08, 0x43, 0x03, 0x03, 0x00, 0x01, 0x18}};
+  const obd::CanFrame badSequence{0x7E8, 8, {0x22, 0x04, 0x20}};
+  const obd::CanFrame next{0x7E8, 8, {0x21, 0x04, 0x20}};
+  assert(response.accept(first) == Result::FLOW_CONTROL);
+  assert(response.accept(badSequence) == Result::INVALID);
+  response.reset();
+  assert(response.accept(first) == Result::FLOW_CONTROL);
+  assert(response.accept(next) == Result::COMPLETE);
+  assert(response.count() == 3 && response.code(2) == 0x0420);
+  const obd::CanFrame truncated{0x7E8, 3, {0x04, 0x43, 0x01}};
+  assert(response.accept(truncated) == Result::INVALID);
+  uint8_t speed = 0;
+  const obd::CanFrame velocity{0x7E8, 8, {0x03, 0x41, 0x0D, 82}};
+  assert(obd::parseCurrentByte(velocity, obd::PID_VEHICLE_SPEED, speed) && speed == 82);
+  assert(!obd::parseCurrentByte(velocity, obd::PID_MONITOR_STATUS, speed));
+}
+
 int main() {
+  testStoredDtcTransport();
   testBuildRequest();
   testParseValidResponses();
   testRejectInvalidResponses();

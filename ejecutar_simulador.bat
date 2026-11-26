@@ -91,7 +91,7 @@ if not defined PY_CMD (
 )
 echo [lilyxm7] Iniciando Simulador WEB con recarga automatica ...
 echo           (Logs en logs\sim_web.log y logs\all.log)
-"%PY_CMD%" "%~dp0sim_web\server.py" --watch-firmware
+"%PY_CMD%" "%~dp0sim_web\server.py" --watch-firmware --serial-console
 if errorlevel 1 (
     echo [ERROR] El servidor web termino con error. Revisa logs\sim_web.log
     pause

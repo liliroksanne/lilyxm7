@@ -19,3 +19,5 @@ ConnectionInfo getConnectionInfo();
 
 // Indica si el firmware fue compilado en modo simulación (Wokwi)
 bool isSimulationMode();
+
+const VehicleTelemetry& getVehicleTelemetry();

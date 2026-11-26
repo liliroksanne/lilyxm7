@@ -66,3 +66,17 @@ struct ConnectionInfo {
   uint32_t lastValidMs;
   uint32_t nowMs;
 };
+
+constexpr uint8_t MAX_STORED_DTCS = 16;
+
+struct VehicleTelemetry {
+  int16_t speedKph = -1;
+  bool accelerationValid = false;
+  int16_t accelerationTenths = 0;  // 0.1 m/s², calculada con muestras PID 0D
+  int8_t mil = -1;                  // -1 = sin respuesta vigente
+  uint8_t reportedDtcCount = 0;      // MIL/PID 01, separado de la lectura modo 03
+  bool dtcValid = false;
+  uint8_t storedDtcCount = 0;
+  uint16_t dtcs[MAX_STORED_DTCS]{};
+  uint32_t revision = 0;
+};

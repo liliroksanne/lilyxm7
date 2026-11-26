@@ -1,3 +1,5 @@
+#include "data_source.h"
+#include "obd_protocol.h"
 #include "ui_tft.h"
 #include "assistant_ascii.h"
 #include "config.h"
@@ -33,6 +35,7 @@ int16_t g_lastTempC = -999;
 TempTrend g_lastTrend = TempTrend::TREND_NONE;
 uint32_t g_lastValidCount = 0;
 uint32_t g_lastConnSec = 999999;
+uint32_t g_lastTelemetryRevision = 0;
 uint32_t g_lastChatVersion = 0;
 uint8_t g_animTick = 0;
 uint32_t g_lastAnimMs = 0;
@@ -65,6 +68,7 @@ void printEs(const char* text, uint16_t color, uint8_t size = 1) {
     if (c == 0xC2 && p[1] != '\0') {
       const uint8_t c2 = p[1];
       if (c2 == 0xB0) g_tft.write(0xF8);      // °
+      else if (c2 == 0xB2) g_tft.write(0xFD); // ²
       else if (c2 == 0xA1) g_tft.write(0xAD); // ¡
       else if (c2 == 0xBF) g_tft.write(0xA8); // ¿
       else if (c2 == 0xAB) g_tft.write(0xAE); // «
@@ -366,7 +370,7 @@ void drawTemperatureRightPanel(const TempReading& r) {
   }
 }
 
-void drawConnectionPanel(const ConnectionInfo& info) {
+void drawConnectionPanel(const ConnectionInfo& info, const VehicleTelemetry& telemetry) {
   constexpr int16_t rx = 154;
   constexpr int16_t ry = 26;
   constexpr int16_t rw = 162;
@@ -380,7 +384,7 @@ void drawConnectionPanel(const ConnectionInfo& info) {
   g_tft.drawFastHLine(rx + 6, ry + 20, rw - 12, COLOR_MATRIX_DARK);
 
   int16_t y = ry + 28;
-  const int16_t step = 16;
+  const int16_t step = 15;
 
   g_tft.setCursor(rx + 8, y);
   printEs("Modo: ", COLOR_MATRIX_DIM, 1);
@@ -406,31 +410,46 @@ void drawConnectionPanel(const ConnectionInfo& info) {
   y += step;
 
   g_tft.setCursor(rx + 8, y);
-  printEs("PID:  ", COLOR_MATRIX_DIM, 1);
-  printEs("01 05 (Refrig.)", COLOR_MATRIX_MID, 1);
+  char buf[42];
+  if (telemetry.speedKph >= 0) snprintf(buf, sizeof(buf), "Vel: %d km/h", telemetry.speedKph);
+  else snprintf(buf, sizeof(buf), "Vel: sin datos");
+  printEs(buf, COLOR_MATRIX_BRIGHT, 1);
   y += step;
 
-  char buf[32];
-  snprintf(buf, sizeof(buf), "TX: %lu  RX: %lu",
-           static_cast<unsigned long>(info.txRequests),
-           static_cast<unsigned long>(info.rxValidFrames));
+  if (telemetry.accelerationValid) {
+    const int value = telemetry.accelerationTenths;
+    const int magnitude = value < 0 ? -value : value;
+    snprintf(buf, sizeof(buf), "Acel: %s%d.%d m/s²", value < 0 ? "-" : "", magnitude / 10, magnitude % 10);
+  } else {
+    snprintf(buf, sizeof(buf), "Acel: sin datos");
+  }
   g_tft.setCursor(rx + 8, y);
   printEs(buf, COLOR_MATRIX_MID, 1);
   y += step;
 
-  if (info.hasLastValue) {
-    const uint32_t ageSec = (info.nowMs >= info.lastValidMs) ? ((info.nowMs - info.lastValidMs) / 1000) : 0;
-    snprintf(buf, sizeof(buf), "Última: %d°C (%lus)", info.lastTempC, static_cast<unsigned long>(ageSec));
-  } else {
-    snprintf(buf, sizeof(buf), "Última: ninguna");
-  }
+  const char* mil = telemetry.mil < 0 ? "sin datos" : telemetry.mil ? "ENCENDIDO" : "apagado";
+  snprintf(buf, sizeof(buf), "MIL: %s", mil);
   g_tft.setCursor(rx + 8, y);
-  printEs(buf, COLOR_MATRIX_DIM, 1);
+  printEs(buf, telemetry.mil == 1 ? COLOR_MATRIX_GLOW : COLOR_MATRIX_MID, 1);
   y += step;
 
-  snprintf(buf, sizeof(buf), "Errores TX: %lu", static_cast<unsigned long>(info.txErrors));
+  if (!telemetry.dtcValid) snprintf(buf, sizeof(buf), "DTC: sin datos");
+  else if (!telemetry.storedDtcCount) snprintf(buf, sizeof(buf), "DTC: 0 guardados");
+  else {
+    char code[6];
+    const unsigned total = telemetry.storedDtcCount;
+    const unsigned shown = total < MAX_STORED_DTCS ? total : MAX_STORED_DTCS;
+    const unsigned index = (info.nowMs / 3000) % shown;
+    obd::formatDtc(telemetry.dtcs[index], code);
+    snprintf(buf, sizeof(buf), "DTC: %s (%u/%u)", code, index + 1, total);
+  }
   g_tft.setCursor(rx + 8, y);
-  printEs(buf, COLOR_MATRIX_DARK, 1);
+  printEs(buf, telemetry.dtcValid && telemetry.storedDtcCount ? COLOR_MATRIX_GLOW : COLOR_MATRIX_MID, 1);
+  y += step;
+  snprintf(buf, sizeof(buf), "TX %lu | RX temp %lu",
+           static_cast<unsigned long>(info.txRequests), static_cast<unsigned long>(info.rxValidFrames));
+  g_tft.setCursor(rx + 8, y);
+  printEs(buf, COLOR_MATRIX_DIM, 1);
 }
 
 } // namespace
@@ -483,6 +502,8 @@ void uiRender(ScreenId screen,
     animChanged = true;
   }
 
+  const VehicleTelemetry& telemetry = getVehicleTelemetry();
+  assistantVehicleAlerts(telemetry);
   const AssistantState assistant = updateAssistantChat(screen, tempReading);
 
   const uint32_t connAgeSec =
@@ -499,7 +520,8 @@ void uiRender(ScreenId screen,
       (tempReading.trend != g_lastTrend) ||
       (tempReading.validCount != g_lastValidCount);
   const bool chatChanged = (assistant.chatVersion != g_lastChatVersion);
-  const bool connTimeChanged = (screen == ScreenId::CONNECTION_STATUS && connAgeSec != g_lastConnSec);
+  const bool connTimeChanged = (screen == ScreenId::CONNECTION_STATUS &&
+      (connAgeSec != g_lastConnSec || telemetry.revision != g_lastTelemetryRevision));
 
   if (!g_needFullRedraw && !screenChanged && !menuChanged && !dataChanged &&
       !connTimeChanged && !chatChanged && !animChanged) {
@@ -537,7 +559,7 @@ void uiRender(ScreenId screen,
     }
   } else if (screen == ScreenId::CONNECTION_STATUS) {
     if (g_needFullRedraw || screenChanged || dataChanged || connTimeChanged) {
-      drawConnectionPanel(connInfo);
+      drawConnectionPanel(connInfo, telemetry);
     }
   }
 
@@ -564,5 +586,6 @@ void uiRender(ScreenId screen,
   g_lastTrend = tempReading.trend;
   g_lastValidCount = tempReading.validCount;
   g_lastConnSec = connAgeSec;
+  g_lastTelemetryRevision = telemetry.revision;
   g_lastChatVersion = assistant.chatVersion;
 }

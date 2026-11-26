@@ -18,6 +18,8 @@ constexpr uint32_t CAN_RESPONSE_ID_MAX       = 0x7EF;
 constexpr uint8_t SERVICE_SHOW_CURRENT_DATA  = 0x01;
 constexpr uint8_t SERVICE_CURRENT_DATA_RESP  = 0x41; // 0x01 + 0x40
 constexpr uint8_t PID_ENGINE_COOLANT_TEMP    = 0x05;
+constexpr uint8_t PID_VEHICLE_SPEED          = 0x0D;
+constexpr uint8_t PID_MONITOR_STATUS         = 0x01;
 
 constexpr int16_t COOLANT_TEMP_MIN_C         = -40;
 constexpr int16_t COOLANT_TEMP_MAX_C         = 215;
@@ -28,21 +30,91 @@ struct CanFrame {
   uint8_t data[8];
 };
 
-// Construye la trama OBD-II Servicio 01, PID 05 (temperatura del refrigerante)
-inline CanFrame buildCoolantTempRequest() {
+inline CanFrame buildRequest(uint8_t service, uint8_t pid = 0) {
   CanFrame frame{};
   frame.id = CAN_REQUEST_ID_FUNCTIONAL;
   frame.dlc = 8;
-  frame.data[0] = 0x02;                      // 2 bytes útiles (Servicio + PID)
-  frame.data[1] = SERVICE_SHOW_CURRENT_DATA; // Servicio 01
-  frame.data[2] = PID_ENGINE_COOLANT_TEMP;   // PID 05
-  frame.data[3] = 0x00;                      // Relleno estándar
-  frame.data[4] = 0x00;
-  frame.data[5] = 0x00;
-  frame.data[6] = 0x00;
-  frame.data[7] = 0x00;
+  frame.data[0] = service == SERVICE_SHOW_CURRENT_DATA ? 2 : 1;
+  frame.data[1] = service;
+  frame.data[2] = pid;
   return frame;
 }
+
+inline CanFrame buildCoolantTempRequest() {
+  return buildRequest(SERVICE_SHOW_CURRENT_DATA, PID_ENGINE_COOLANT_TEMP);
+}
+
+inline uint8_t singleFrameLength(const CanFrame& frame) {
+  const uint8_t length = frame.data[0];
+  return frame.dlc <= 8 && length >= 1 && length <= 7 && length < frame.dlc ? length : 0;
+}
+
+inline bool parseCurrentByte(const CanFrame& frame, uint8_t pid, uint8_t& value) {
+  if (frame.id < CAN_RESPONSE_ID_MIN || frame.id > CAN_RESPONSE_ID_MAX ||
+      singleFrameLength(frame) < (pid == PID_MONITOR_STATUS ? 6 : 3) ||
+      frame.data[1] != SERVICE_CURRENT_DATA_RESP || frame.data[2] != pid) {
+    return false;
+  }
+  value = frame.data[3];
+  return true;
+}
+
+inline void formatDtc(uint16_t value, char (&text)[6]) {
+  constexpr char hex[] = "0123456789ABCDEF";
+  text[0] = "PCBU"[value >> 14];
+  text[1] = hex[(value >> 12) & 3];
+  text[2] = hex[(value >> 8) & 15];
+  text[3] = hex[(value >> 4) & 15];
+  text[4] = hex[value & 15];
+  text[5] = '\0';
+}
+
+class StoredDtcResponse {
+public:
+  enum class Result { IGNORE, FLOW_CONTROL, WAIT, COMPLETE, INVALID };
+
+  void reset() { expected_ = 0; used_ = 0; seq_ = 1; }
+
+  Result accept(const CanFrame& frame) {
+    if (frame.id != CAN_RESPONSE_ID_MIN || frame.dlc < 2 || frame.dlc > 8) return Result::IGNORE;
+    const uint8_t type = frame.data[0] >> 4;
+    if (type == 0 && frame.data[1] == 0x43) {
+      expected_ = singleFrameLength(frame);
+      if (expected_ < 2) return Result::INVALID;
+      used_ = 0;
+      append(frame.data + 1, expected_);
+    } else if (type == 1 && frame.dlc == 8 && frame.data[2] == 0x43) {
+      expected_ = ((frame.data[0] & 15) << 8) | frame.data[1];
+      if (expected_ <= 7 || expected_ > sizeof(payload_)) return Result::INVALID;
+      used_ = 0;
+      seq_ = 1;
+      append(frame.data + 2, 6);
+      return Result::FLOW_CONTROL;
+    } else if (type == 2 && used_ && used_ < expected_) {
+      if ((frame.data[0] & 15) != seq_) return Result::INVALID;
+      seq_ = (seq_ + 1) & 15;
+      append(frame.data + 1, frame.dlc - 1);
+    } else {
+      return Result::IGNORE;
+    }
+    if (used_ < expected_) return Result::WAIT;
+    return expected_ == 2 + 2 * static_cast<size_t>(payload_[1]) ? Result::COMPLETE : Result::INVALID;
+  }
+
+  uint8_t count() const { return payload_[1]; }
+  uint16_t code(size_t index) const {
+    return (static_cast<uint16_t>(payload_[2 + index * 2]) << 8) | payload_[3 + index * 2];
+  }
+
+private:
+  void append(const uint8_t* bytes, size_t length) {
+    for (size_t i = 0; i < length && used_ < expected_; ++i) payload_[used_++] = bytes[i];
+  }
+  uint8_t payload_[512]{};
+  size_t expected_ = 0;
+  size_t used_ = 0;
+  uint8_t seq_ = 1;
+};
 
 // Convierte °C (-40..215) al byte A de OBD-II (A = °C + 40)
 inline uint8_t encodeCoolantTempByte(int16_t tempC) {
@@ -57,28 +129,9 @@ inline uint8_t encodeCoolantTempByte(int16_t tempC) {
 // Decodifica una respuesta OBD-II de temperatura del refrigerante (Servicio 01, PID 05)
 // Fórmula estándar SAE J1979: Temperatura (°C) = A - 40
 inline bool parseCoolantTempResponse(const CanFrame& frame, int16_t& outTempC) {
-  if (frame.id < CAN_RESPONSE_ID_MIN || frame.id > CAN_RESPONSE_ID_MAX) {
-    return false;
-  }
-  if (frame.dlc < 4) {
-    return false;
-  }
-
-  // ISO-TP Single Frame: nibble alto = 0x0, nibble bajo = longitud útil (>= 3 bytes: 41 05 A)
-  const uint8_t pciType = (frame.data[0] & 0xF0) >> 4;
-  const uint8_t payloadLen = frame.data[0] & 0x0F;
-  if (pciType != 0x0 || payloadLen < 3 || payloadLen > 7) {
-    return false;
-  }
-
-  if (frame.data[1] != SERVICE_CURRENT_DATA_RESP) {
-    return false;
-  }
-  if (frame.data[2] != PID_ENGINE_COOLANT_TEMP) {
-    return false;
-  }
-
-  outTempC = static_cast<int16_t>(frame.data[3]) - 40;
+  uint8_t value;
+  if (!parseCurrentByte(frame, PID_ENGINE_COOLANT_TEMP, value)) return false;
+  outTempC = static_cast<int16_t>(value) - 40;
   return true;
 }
 

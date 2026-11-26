@@ -1,5 +1,6 @@
 #include "assistant_ascii.h"
 #include "config.h"
+#include "obd_protocol.h"
 #include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +12,9 @@ uint8_t g_chatCount = 0;
 uint32_t g_chatVersion = 0;
 uint32_t g_eyeStartedMs = 0;
 uint32_t g_eyeDurationMs = 0;
+int8_t g_lastMil = -1;
+int16_t g_lastStoredCount = -1;
+uint16_t g_lastCodes[MAX_STORED_DTCS]{};
 
 bool g_hasInitialized = false;
 ScreenId g_prevScreen = ScreenId::MAIN_MENU;
@@ -113,6 +117,8 @@ void assistantChatInit(bool isSimulated) {
   g_chatCount = 0;
   g_chatVersion = 0;
   g_eyeDurationMs = 0;
+  g_lastMil = -1;
+  g_lastStoredCount = -1;
   pinMode(PIN_LILY_EYE, OUTPUT);
   digitalWrite(PIN_LILY_EYE, LOW);
   g_hasInitialized = true;
@@ -255,4 +261,27 @@ const ChatMessage& getChatMessage(uint8_t index) {
     return g_chatHistory[0];
   }
   return g_chatHistory[index];
+}
+
+void assistantVehicleAlerts(const VehicleTelemetry& telemetry) {
+  if (telemetry.mil >= 0 && telemetry.mil != g_lastMil) {
+    if (telemetry.mil == 1) pushChatMessage("ALERTA: Check Engine", true);
+    else if (g_lastMil == 1) pushChatMessage("Testigo motor apagado.", false);
+    g_lastMil = telemetry.mil;
+  }
+  if (!telemetry.dtcValid) return;
+  const uint8_t count = telemetry.storedDtcCount;
+  const size_t bytes = (count < MAX_STORED_DTCS ? count : MAX_STORED_DTCS) * sizeof(uint16_t);
+  if (count == g_lastStoredCount && memcmp(g_lastCodes, telemetry.dtcs, bytes) == 0) return;
+
+  if (count) {
+    char code[6], message[CHAT_MSG_MAX_LEN];
+    obd::formatDtc(telemetry.dtcs[0], code);
+    snprintf(message, sizeof(message), "ALERTA: %s (%u DTC)", code, static_cast<unsigned>(count));
+    pushChatMessage(message, true);
+  } else if (g_lastStoredCount > 0) {
+    pushChatMessage("ECU sin DTC guardados.", false);
+  }
+  g_lastStoredCount = count;
+  memcpy(g_lastCodes, telemetry.dtcs, bytes);
 }

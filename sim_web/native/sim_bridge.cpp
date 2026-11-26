@@ -8,6 +8,7 @@
 #include "Adafruit_GFX.h"
 #include "Adafruit_ILI9341.h"
 #include "driver/twai.h"
+#include "../../lilyxm7/obd_protocol.h"
 
 #include <cstdio>
 #include <cstring>
@@ -120,6 +121,10 @@ namespace {
 twai_state_t g_state = TWAI_STATE_STOPPED;
 int g_ecuTempC = 86;
 bool g_ecuOnline = true;
+int g_ecuSpeed = 0;
+uint16_t g_ecuCodes[MAX_STORED_DTCS]{};
+int g_ecuCodeCount = 0;
+std::deque<twai_message_t> g_dtcContinuation;
 uint32_t g_recoveryStartedMs = 0;
 std::deque<twai_message_t> g_rxQueue;
 std::mutex g_canMtx;
@@ -158,6 +163,7 @@ int popCanLog(char* outBuf, int maxLen) {
 esp_err_t twai_driver_install(const twai_general_config_t*, const twai_timing_config_t*, const twai_filter_config_t*) {
   sim_can::g_state = TWAI_STATE_STOPPED;
   sim_can::g_rxQueue.clear();
+  sim_can::g_dtcContinuation.clear();
   sim_can::appendCanLog("[BUS] TWAI instalado a 500 kbps (ISO 15765-4 Vitara 2008)");
   return ESP_OK;
 }
@@ -182,6 +188,58 @@ esp_err_t twai_transmit(const twai_message_t* msg, TickType_t) {
 
   if (!sim_can::g_ecuOnline) {
     return ESP_OK; // Sin respuesta de la ECU -> disparará timeout en data_source.cpp
+  }
+
+  if (msg->identifier == 0x7E0 && msg->data[0] == 0x30) {
+    while (!sim_can::g_dtcContinuation.empty()) {
+      sim_can::g_rxQueue.push_back(sim_can::g_dtcContinuation.front());
+      sim_can::g_dtcContinuation.pop_front();
+    }
+    return ESP_OK;
+  }
+  if (msg->identifier != 0x7DF && msg->identifier != 0x7E0) return ESP_OK;
+
+  twai_message_t answer{};
+  answer.identifier = 0x7E8;
+  answer.data_length_code = 8;
+  if (msg->data[0] == 0x02 && msg->data[1] == 0x01) {
+    const uint8_t pid = msg->data[2];
+    if (pid == obd::PID_VEHICLE_SPEED || pid == obd::PID_MONITOR_STATUS) {
+      answer.data[0] = pid == obd::PID_MONITOR_STATUS ? 6 : 3;
+      answer.data[1] = 0x41;
+      answer.data[2] = pid;
+      answer.data[3] = pid == obd::PID_VEHICLE_SPEED ? sim_can::g_ecuSpeed :
+          (sim_can::g_ecuCodeCount ? 0x80 | sim_can::g_ecuCodeCount : 0);
+      sim_can::g_rxQueue.push_back(answer);
+      return ESP_OK;
+    }
+  }
+  if (msg->data[0] == 0x01 && msg->data[1] == 0x03) {
+    uint8_t payload[2 + 2 * MAX_STORED_DTCS] = {0x43, static_cast<uint8_t>(sim_can::g_ecuCodeCount)};
+    const int length = 2 + 2 * sim_can::g_ecuCodeCount;
+    for (int i = 0; i < sim_can::g_ecuCodeCount; ++i) {
+      payload[2 + i * 2] = sim_can::g_ecuCodes[i] >> 8;
+      payload[3 + i * 2] = sim_can::g_ecuCodes[i] & 255;
+    }
+    sim_can::g_dtcContinuation.clear();
+    if (length <= 7) {
+      answer.data[0] = length;
+      std::memcpy(answer.data + 1, payload, length);
+    } else {
+      answer.data[0] = 0x10 | (length >> 8);
+      answer.data[1] = length & 255;
+      std::memcpy(answer.data + 2, payload, 6);
+      for (int pos = 6, sequence = 1; pos < length; pos += 7, ++sequence) {
+        twai_message_t next{};
+        next.identifier = answer.identifier;
+        next.data_length_code = 8;
+        next.data[0] = 0x20 | (sequence & 15);
+        std::memcpy(next.data + 1, payload + pos, length - pos < 7 ? length - pos : 7);
+        sim_can::g_dtcContinuation.push_back(next);
+      }
+    }
+    sim_can::g_rxQueue.push_back(answer);
+    return ESP_OK;
   }
 
   // Respuesta virtual de ECU Suzuki Grand Vitara para Servicio 01, PID 05
@@ -337,4 +395,31 @@ SIM_EXPORT uint32_t sim_get_gpio_mask() {
 
 SIM_EXPORT int sim_get_eye() {
   return digitalRead(PIN_LILY_EYE) == HIGH;
+}
+
+SIM_EXPORT void sim_set_ecu_telemetry(int speed, const uint16_t* codes, int count) {
+  sim_can::g_ecuSpeed = speed;
+  sim_can::g_ecuCodeCount = count < MAX_STORED_DTCS ? count : MAX_STORED_DTCS;
+  for (int i = 0; i < sim_can::g_ecuCodeCount; ++i) sim_can::g_ecuCodes[i] = codes[i];
+}
+
+SIM_EXPORT int sim_read_vehicle_telemetry(int* out, int capacity) {
+  constexpr int fields = 6;
+  if (!out || capacity < fields + MAX_STORED_DTCS) return 0;
+  const VehicleTelemetry& readings = getVehicleTelemetry();
+  out[0] = readings.speedKph;
+  out[1] = readings.accelerationValid ? readings.accelerationTenths : -32768;
+  out[2] = readings.mil;
+  out[3] = readings.mil < 0 ? -1 : readings.reportedDtcCount;
+  out[4] = readings.dtcValid ? readings.storedDtcCount : -1;
+  out[5] = static_cast<int>(getConnectionInfo().busState);
+  const int returned = out[4] < 0 ? 0 : out[4] < MAX_STORED_DTCS ? out[4] : MAX_STORED_DTCS;
+  for (int i = 0; i < returned; ++i) out[fields + i] = readings.dtcs[i];
+  return fields + returned;
+}
+
+SIM_EXPORT void sim_get_board_snapshot(uint32_t* out) {
+  out[0] = millis();
+  out[1] = static_cast<uint32_t>(g_currentScreen);
+  out[2] = getCoolantTemperature().hasLiveSignal;
 }

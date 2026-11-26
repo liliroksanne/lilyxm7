@@ -27,9 +27,10 @@ Originalmente se consideró **Wokwi** para simular el tablero y una herramienta 
 - **Chatbot simple Matrix (`lilyxm7/assistant_ascii.*`)**: panel `CHAT // LILY` con burbujas en verde fósforo sobre negro que informa cambios de temperatura (*motor frío*, *calentando*, *óptimo*, *temperatura alta*, *peligro/sobrecalentamiento*), tendencias (*subió/bajó*) y pérdida o recuperación de señal.
 - **Menú físico (`lilyxm7/buttons.*`, `lilyxm7/ui_tft.*`)**: navegación con **↑** y **↓**, selección con **A** y regreso con **B**. Opciones actuales:
   1. **Temperatura**: lectura en vivo en `°C`, tendencia respecto a la lectura anterior, barra térmica y mensajes de Lily.
-  2. **Estado de conexión**: modo activo, estado de la ECU, estado del bus CAN/TWAI, tramas TX/RX, errores y última lectura.
+  2. **Estado de conexión**: estado de ECU y TWAI, velocidad (PID 0D), aceleración estimada en m/s², testigo Check Engine (PID 01) y códigos confirmados de la computadora del motor (servicio 03). La TFT alterna los códigos y conserva la temperatura como primera opción.
 - **Función común de datos (`getCoolantTemperature()`)**: definida en `lilyxm7/data_source.*` para que el menú y el chatbot usen exactamente la misma entrada tanto con datos simulados como con el bus OBD-II real (`driver/twai.h` + `SN65HVD230`).
 - **Pérdida de señal**: si la ECU deja de responder por 3 segundos, muestra **«Sin datos del auto»** y conserva el último valor válido claramente etiquetado como **«Última lectura»**.
+- **Serial del firmware**. La opción [1] muestra la salida de `Serial` en la terminal de Windows, en el monitor junto al TFT y en `logs/firmware_serial.log`. El TFT web presenta el búfer RGB dibujado por el mismo C++ que se compila para la ESP32. El puente nativo modela sus periféricos.
 - **Logs unificados (`logs/` y frontend)**: todos los componentes registran eventos en `C:\Git\lilyxm7\logs\` (ignorado por Git) y los muestran filtrables por componente en el Simulador Web.
 
 ---
@@ -74,7 +75,7 @@ Haz doble clic o ejecuta en PowerShell:
 ```
 
 Opciones principales:
-- **`[1]` Simulador WEB propio de `lilyxm7`**: abre `http://127.0.0.1:8765` en Chrome/Edge, 100 % offline, con pantalla TFT 2.4", chatbot Lily, motor Vitara con calentamiento gradual, bus OBD-II `01 05` y logs por componente.
+- **`[1]` Simulador WEB propio de `lilyxm7`**: abre `http://127.0.0.1:8765` en Chrome/Edge, 100 % offline, con pantalla TFT 2.4", chatbot Lily, motor Vitara con calentamiento gradual, bus OBD-II y logs por componente. En **Camioneta completa** se ven juntos la ECU, el escáner, el radiador y los estados del cableado. Ajusta la velocidad objetivo o el caso de DTC para probar las lecturas y alertas del firmware.
 - **`[4]` Instalar herramientas (una sola vez)**: instala `arduino-cli`, core `esp32:esp32`, librerías `Adafruit GFX` / `Adafruit ILI9341` y **`g++` (WinLibs)** para activar el **Motor C++ Real** dentro del simulador web.
 - **`[5]` Compilar firmware REAL para la Vitara**: compila con `LILYXM7_SIMULATION_MODE=0` para subir a la placa física.
 - **`[6]` Capturar logs USB de la ESP32-S3 real**: lee el puerto COM a 115200 baud y guarda todo en `logs/esp32_serial.log`.
@@ -99,7 +100,7 @@ Consulta las conexiones exactas y precauciones en [`docs/wiring_vitara_2008.md`]
 
 ## Próximos retos y hoja de ruta
 
-- Perfeccionar el simulador local (`sim_web/`) con más PIDs reales de la Vitara 2008 (**RPM `01 0C`**, velocidad `01 0D`, carga del motor, voltaje de batería y códigos de falla DTC).
+- Ampliar las consultas OBD-II con RPM (`01 0C`), carga del motor y voltaje de batería.
 - Historial de temperaturas máximas/mínimas en pantalla.
 - Avisos sonoros / de voz con la bocina del kit LAFVIN.
 - Módulo de pruebas de relevadores en banco usando el **ULN2003AN** (también simulable en el banco local).

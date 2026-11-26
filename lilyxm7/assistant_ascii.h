@@ -35,3 +35,5 @@ AssistantState updateAssistantChat(ScreenId screen, const TempReading& reading);
 // Consulta el historial actual (0 = más antiguo visible, count-1 = más reciente)
 uint8_t getChatMessageCount();
 const ChatMessage& getChatMessage(uint8_t index);
+
+void assistantVehicleAlerts(const VehicleTelemetry& telemetry);

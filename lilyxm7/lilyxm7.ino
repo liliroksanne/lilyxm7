@@ -79,6 +79,7 @@ void setup() {
   dataSourceInit();
   assistantChatInit(isSimulationMode());
   uiInit();
+  Serial.println(F("[LOG][UI] TFT ILI9341 listo: 320x240 | pantalla=MAIN_MENU"));
 }
 
 void loop() {

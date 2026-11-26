@@ -14,6 +14,7 @@ obd::TempTracker g_tracker(LILYXM7_SIMULATION_MODE != 0, TEMP_TREND_DEADBAND_C);
 BusHardwareState g_busState =
     (LILYXM7_SIMULATION_MODE != 0) ? BusHardwareState::SIMULATED : BusHardwareState::INIT_ERROR;
 
+VehicleTelemetry g_telemetry;
 uint32_t g_lastPollMs = 0;
 uint32_t g_txRequests = 0;
 uint32_t g_txErrors = 0;
@@ -83,12 +84,20 @@ void updateSimulationSource(uint32_t nowMs) {
 
 #else // MODO OBD-II REAL (TWAI + SN65HVD230)
 
+constexpr uint32_t DIAGNOSTIC_POLL_MS = 5000;
+constexpr uint32_t DTC_RESPONSE_TIMEOUT_MS = 1000;
+constexpr uint32_t DIAGNOSTIC_STALE_MS = 12000;
+uint32_t g_speedMs = 0, g_milMs = 0, g_dtcMs = 0, g_diagPollMs = 0;
+bool g_dtcPending = false;
+uint32_t g_telemetryLogMs = 0;
+obd::StoredDtcResponse g_dtcResponse;
+
 bool startTwaiDriver() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
       static_cast<gpio_num_t>(PIN_CAN_TX),
       static_cast<gpio_num_t>(PIN_CAN_RX),
       TWAI_MODE_NORMAL);
-  g_config.rx_queue_len = 16;
+  g_config.rx_queue_len = 64;
   g_config.tx_queue_len = 8;
 
   // Suzuki Grand Vitara 2008 V6 2.7 L: ISO 15765-4 CAN 11-bit a 500 kbps
@@ -111,12 +120,14 @@ bool startTwaiDriver() {
 
 void initObdRealSource() {
   g_tracker.reset(false);
+  g_speedMs = g_milMs = g_dtcMs = g_diagPollMs = g_telemetryLogMs = 0;
+  g_dtcPending = false;
+  g_dtcResponse.reset();
   g_lastPollMs = 0;
   g_busState = startTwaiDriver() ? BusHardwareState::RUNNING : BusHardwareState::INIT_ERROR;
 }
 
-void sendCoolantRequestReal() {
-  const obd::CanFrame req = obd::buildCoolantTempRequest();
+bool transmitObd(const obd::CanFrame& req) {
   twai_message_t txMsg{};
   txMsg.identifier = req.id;
   txMsg.extd = 0;
@@ -133,6 +144,7 @@ void sendCoolantRequestReal() {
                     static_cast<int>(err), static_cast<unsigned long>(g_txErrors));
     }
   }
+  return err == ESP_OK;
 }
 
 void handleTwaiRecovery() {
@@ -154,6 +166,52 @@ void handleTwaiRecovery() {
     }
   } else if (status.state == TWAI_STATE_RUNNING) {
     g_busState = BusHardwareState::RUNNING;
+  }
+}
+
+void readTelemetryFrame(const obd::CanFrame& frame, uint32_t nowMs) {
+  // La PCM del motor responde en 7E8. Conservamos 7E8–7EF para el PID térmico heredado.
+  if (frame.id != obd::CAN_RESPONSE_ID_MIN) return;
+  uint8_t value;
+  if (obd::parseCurrentByte(frame, obd::PID_VEHICLE_SPEED, value)) {
+    const uint32_t elapsed = nowMs - g_speedMs;
+    g_telemetry.accelerationValid = g_telemetry.speedKph >= 0 && elapsed >= 250 && elapsed < SIGNAL_TIMEOUT_MS;
+    if (g_telemetry.accelerationValid) {
+      const int32_t delta = static_cast<int32_t>(value) - g_telemetry.speedKph;
+      g_telemetry.accelerationTenths = static_cast<int16_t>(delta * 25000 / (9 * static_cast<int32_t>(elapsed)));
+    }
+    g_speedMs = nowMs;
+    g_telemetry.speedKph = value;
+    ++g_telemetry.revision;
+  } else if (obd::parseCurrentByte(frame, obd::PID_MONITOR_STATUS, value)) {
+    g_milMs = nowMs;
+    g_telemetry.mil = (value >> 7) & 1;
+    g_telemetry.reportedDtcCount = value & 0x7F;
+    ++g_telemetry.revision;
+  } else if (g_dtcPending) {
+    using Result = obd::StoredDtcResponse::Result;
+    const Result result = g_dtcResponse.accept(frame);
+    if (result == Result::FLOW_CONTROL) {
+      // CAN físico de la PCM, ISO-TP Continue To Send, sin límite de bloque.
+      obd::CanFrame flow{};
+      flow.id = obd::CAN_RESPONSE_ID_MIN - 8;
+      flow.dlc = 8;
+      flow.data[0] = 0x30;
+      flow.data[2] = 5;  // separación mínima de 5 ms entre tramas consecutivas
+      g_dtcPending = transmitObd(flow);
+    } else if (result == Result::COMPLETE) {
+      g_dtcMs = nowMs;
+      g_telemetry.dtcValid = true;
+      g_telemetry.storedDtcCount = g_dtcResponse.count();
+      Serial.printf("[LOG][DATA] modo03 DTC_confirmados=%u\n", static_cast<unsigned>(g_telemetry.storedDtcCount));
+      for (uint8_t i = 0; i < g_telemetry.storedDtcCount && i < MAX_STORED_DTCS; ++i) {
+        g_telemetry.dtcs[i] = g_dtcResponse.code(i);
+      }
+      ++g_telemetry.revision;
+      g_dtcPending = false;
+    } else if (result == Result::INVALID) {
+      g_dtcPending = false;
+    }
   }
 }
 
@@ -179,6 +237,8 @@ void drainTwaiRx(uint32_t nowMs) {
     int16_t tempC = 0;
     if (obd::parseCoolantTempResponse(frame, tempC)) {
       g_tracker.recordValidReading(tempC, nowMs);
+    } else {
+      readTelemetryFrame(frame, nowMs);
     }
   }
 }
@@ -188,14 +248,45 @@ void updateObdRealSource(uint32_t nowMs) {
     return;
   }
 
+  if (g_dtcPending && nowMs - g_diagPollMs >= DTC_RESPONSE_TIMEOUT_MS) g_dtcPending = false;
+  if (g_telemetry.speedKph >= 0 && nowMs - g_speedMs >= SIGNAL_TIMEOUT_MS) {
+    g_telemetry.speedKph = -1;
+    g_telemetry.accelerationValid = false;
+    ++g_telemetry.revision;
+  }
+  if (g_telemetry.mil >= 0 && nowMs - g_milMs >= DIAGNOSTIC_STALE_MS) {
+    g_telemetry.mil = -1;
+    ++g_telemetry.revision;
+  }
+  if (g_telemetry.dtcValid && nowMs - g_dtcMs >= DIAGNOSTIC_STALE_MS) {
+    g_telemetry.dtcValid = false;
+    ++g_telemetry.revision;
+  }
+
   handleTwaiRecovery();
 
   if (g_busState == BusHardwareState::RUNNING) {
     if ((nowMs - g_lastPollMs) >= OBD_POLL_INTERVAL_MS || g_lastPollMs == 0) {
       g_lastPollMs = nowMs;
-      sendCoolantRequestReal();
+      transmitObd(obd::buildCoolantTempRequest());
+      transmitObd(obd::buildRequest(0x01, obd::PID_VEHICLE_SPEED));
+    }
+    if (!g_diagPollMs || nowMs - g_diagPollMs >= DIAGNOSTIC_POLL_MS) {
+      g_diagPollMs = nowMs;
+      g_dtcResponse.reset();
+      transmitObd(obd::buildRequest(0x01, obd::PID_MONITOR_STATUS));
+      g_dtcPending = transmitObd(obd::buildRequest(0x03));
     }
     drainTwaiRx(nowMs);
+    if (g_telemetry.speedKph >= 0 && (!g_telemetryLogMs || nowMs - g_telemetryLogMs >= 1000)) {
+      g_telemetryLogMs = nowMs;
+      if (g_telemetry.accelerationValid) {
+        Serial.printf("[LOG][DATA] velocidad_kmh=%d acel_decimas_ms2=%d\n",
+                      g_telemetry.speedKph, g_telemetry.accelerationTenths);
+      } else {
+        Serial.printf("[LOG][DATA] velocidad_kmh=%d acel_sin_muestra\n", g_telemetry.speedKph);
+      }
+    }
   }
 
   g_tracker.updateTimeout(nowMs, SIGNAL_TIMEOUT_MS);
@@ -206,6 +297,7 @@ void updateObdRealSource(uint32_t nowMs) {
 } // namespace
 
 void dataSourceInit() {
+  g_telemetry = {};
   g_lastLoggedLive = false;
   g_lastLoggedTemp = -999;
   g_txRequests = 0;
@@ -250,3 +342,5 @@ ConnectionInfo getConnectionInfo() {
 bool isSimulationMode() {
   return (LILYXM7_SIMULATION_MODE != 0);
 }
+
+const VehicleTelemetry& getVehicleTelemetry() { return g_telemetry; }
