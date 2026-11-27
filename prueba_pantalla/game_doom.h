@@ -6,5 +6,5 @@
 
 void doomStart();
 void doomRenderFull();
-bool doomHandleButton(int pin); // Devuelve true si se presionó [B] para volver al menú
+bool doomHandleButton(int pin); // Devuelve true si se presionó [SELECT] para volver al menú
 void doomTick();

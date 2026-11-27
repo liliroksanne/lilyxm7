@@ -1,4 +1,5 @@
 #include "game_doom.h"
+#include "abyss_sprites.h"
 #include "board_config.h"
 #include "display_driver.h"
 #include "input_buttons.h"
@@ -14,7 +15,7 @@ constexpr int DOOM_H = 90;
 constexpr int DOOM_VIEW_Y = 22;
 constexpr int DOOM_MAP_W = 16;
 constexpr int DOOM_MAP_H = 16;
-constexpr int DOOM_MAX_ENEMIES = 6;
+constexpr int DOOM_MAX_ENEMIES = ABYSS_SPECIES_COUNT;
 constexpr int DOOM_MAX_ITEMS   = 4;
 
 uint8_t g_map[DOOM_MAP_H][DOOM_MAP_W];
@@ -27,11 +28,13 @@ struct DoomEnemy {
   uint8_t hurtFrames;
   uint32_t lastAtkMs;
   uint8_t species;
+  uint32_t deathMs;
+  uint32_t windupMs;
+  bool winding;
 };
 
 struct DoomItem {
   float x, y;
-  uint8_t type; // 1 = Medikit (+25 HP), 2 = Balas (+8)
   bool active;
 };
 
@@ -44,75 +47,143 @@ float g_pX = START_X, g_pY = START_Y;
 float g_pDirX = 1.0f, g_pDirY = 0.0f;
 float g_pPlaneX = 0.0f, g_pPlaneY = 0.66f;
 int g_hp = 100;
-int g_ammo = 24;
 int g_kills = 0;
-uint8_t g_gunRecoil = 0;
 uint8_t g_hurtFlash = 0;
-uint32_t g_lastShotMs = 0;
+constexpr uint32_t KATANA_SWING_MS = 280;
+constexpr uint32_t KATANA_IMPACT_MS = 90;
+constexpr uint32_t KATANA_COOLDOWN_MS = 340;
+constexpr uint32_t DASH_COOLDOWN_MS = 650;
+constexpr uint32_t DEATH_MS = 440;
+constexpr uint32_t WINDUP_MS = 560;
+constexpr uint16_t TEMPLE_VOID = 0x100B;
+constexpr uint16_t TEMPLE_STONE = 0x2910;
+constexpr uint16_t TEMPLE_METAL = 0x4937;
+constexpr uint16_t TEMPLE_NEON = 0xC31F;
+constexpr uint16_t TEMPLE_CYAN = 0x46BD;
+constexpr uint16_t ATTACK_WARNING = 0xFDA3;
+uint32_t g_lastSwingMs = 0;
+bool g_katanaPending = false;
+uint32_t g_lastDashMs = 0;
+float g_dashRemaining = 0.0f;
+float g_dashX = 0.0f, g_dashY = 0.0f;
+bool g_dashReady = true;
 uint32_t g_lastFrameMs = 0;
 uint32_t g_startMs = 0;
 bool g_dead = false;
 bool g_win = false;
 bool g_showMap = true;
-bool g_prevFireHigh = true;
 DoomEnemy g_enemies[DOOM_MAX_ENEMIES];
 DoomItem g_items[DOOM_MAX_ITEMS];
 
-void generateLevel() {
-  // Se conectan nueve salas abriendo puertas en orden aleatorio.
-  for (int y = 0; y < DOOM_MAP_H; ++y) {
-    for (int x = 0; x < DOOM_MAP_W; ++x) {
-      g_map[y][x] = (x % 5 == 0 || y % 5 == 0) ? static_cast<uint8_t>(random(1, 4)) : 0;
-    }
-  }
+struct TempleDoor {
+  int from, to, x, y;
+};
 
-  struct Door { int from, to, x, y; };
-  Door doors[12];
+void generateLevel() {
+  // Crece un camino principal con ramales. Los sectores sobrantes quedan macizos.
+  TempleDoor doors[12];
   int count = 0;
   for (int room = 0; room < 9; ++room) {
-    const int x = room % 3 * 5;
-    const int y = room / 3 * 5;
+    const int x = room % 3 * 5, y = room / 3 * 5;
     if (room % 3 < 2) doors[count++] = {room, room + 1, x + 5, y + 2};
     if (room / 3 < 2) doors[count++] = {room, room + 3, x + 2, y + 5};
   }
-
-  int group[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
-  int loops = 0;
-  while (count > 0) {
-    const int pick = random(count);
-    const Door door = doors[pick];
-    doors[pick] = doors[--count];
-    const int from = group[door.from], to = group[door.to];
-    if (from == to) {
-      if (loops++ < 2) g_map[door.y][door.x] = 0;
-      continue;
+  int depth[9] = {1};
+  const int roomCount = random(5, 9);
+  for (int built = 1; built < roomCount; ++built) {
+    int frontier[12], frontierCount = 0;
+    for (int i = 0; i < count; ++i) {
+      if ((depth[doors[i].from] == 0) != (depth[doors[i].to] == 0)) frontier[frontierCount++] = i;
     }
-    g_map[door.y][door.x] = 0;
-    for (int& id : group) {
-      if (id == to) id = from;
+    const int chosen = frontier[random(frontierCount)];
+    const TempleDoor door = doors[chosen];
+    const int next = depth[door.from] ? door.to : door.from;
+    depth[next] = depth[door.from] + depth[door.to] + 1;
+    doors[chosen] = doors[--count];
+    doors[count] = door;
+  }
+
+  for (auto& row : g_map) {
+    for (auto& tile : row) tile = 1;
+  }
+
+  // Las formas conservan la cruz central que une los cuatro umbrales.
+  constexpr const char* shapes[][4] = {
+    {"....", "....", "....", "...."}, // nave
+    {"#..#", "....", "....", "#..#"}, // cripta octogonal
+    {"...#", "....", "....", "...#"}, // galeria estrecha
+    {"#..#", "....", "....", "...."}, // altar con hornacinas
+    {"....", "....", "....", "#.##"}, // taller de relicarios
+    {"#...", "....", "....", "#.#."}  // capilla irregular
+  };
+  for (int room = 0; room < 9; ++room) {
+    if (!depth[room]) continue;
+    const int ox = room % 3 * 5, oy = room / 3 * 5;
+    const int style = room == 0 ? 0 : random(6);
+    const uint8_t material = 1 + style % 3;
+    for (int y = 0; y < 4; ++y) {
+      for (int x = 0; x < 4; ++x) {
+        g_map[oy + y + 1][ox + x + 1] = shapes[style][y][x] == '.' ? 0 : 3;
+      }
+    }
+    for (int lane = 1; lane <= 4; ++lane) {
+      g_map[oy][ox + lane] = g_map[oy + 5][ox + lane] = material;
+      g_map[oy + lane][ox] = g_map[oy + lane][ox + 5] = material;
     }
   }
-  const int portalOffset = random(11, 15);
-  if (random(2)) g_map[portalOffset][15] = 4;
-  else g_map[15][portalOffset] = 4;
 
-  int rooms[] = {1, 2, 3, 4, 5, 6, 7, 8};
-  for (int i = 7; i > 0; --i) {
-    const int j = random(i + 1);
-    const int saved = rooms[i];
-    rooms[i] = rooms[j];
-    rooms[j] = saved;
+  for (int i = count; i < 12; ++i) g_map[doors[i].y][doors[i].x] = 0;
+  if (random(3) == 0) {
+    for (int i = 0; i < count; ++i) {
+      const TempleDoor& door = doors[i];
+      if (depth[door.from] && depth[door.to]) {
+        g_map[door.y][door.x] = 0;
+        break;
+      }
+    }
   }
-  for (int i = 0; i < DOOM_MAX_ENEMIES; ++i) {
-    const int room = rooms[i];
-    const uint8_t species = (i + g_level) % 3;
-    g_enemies[i] = {room % 3 * 5 + 3.5f, room / 3 * 5 + 3.5f,
-                    static_cast<int8_t>(species == 1 ? 3 : 2), true, 0, 0, species};
+
+  int portalX = 0, portalY = 2, portalDepth = 0;
+  constexpr int sideX[] = {-1, 1, 0, 0};
+  constexpr int sideY[] = {0, 0, -1, 1};
+  for (int room = 0; room < 9; ++room) {
+    if (depth[room] <= portalDepth) continue;
+    const int col = room % 3, row = room / 3;
+    const int firstSide = random(4);
+    for (int j = 0; j < 4; ++j) {
+      const int side = (firstSide + j) % 4;
+      const int nx = col + sideX[side], ny = row + sideY[side];
+      if (nx >= 0 && nx < 3 && ny >= 0 && ny < 3 && depth[ny * 3 + nx]) continue;
+      portalX = col * 5 + (sideX[side] < 0 ? 0 : sideX[side] > 0 ? 5 : 2);
+      portalY = row * 5 + (sideY[side] < 0 ? 0 : sideY[side] > 0 ? 5 : 2);
+      portalDepth = depth[room];
+      break;
+    }
   }
-  for (int i = 0; i < DOOM_MAX_ITEMS; ++i) {
-    const int room = rooms[(i + 4) % 8];
-    g_items[i] = {room % 3 * 5 + 1.5f, room / 3 * 5 + 1.5f,
-                  static_cast<uint8_t>(i % 2 + 1), true};
+  g_map[portalY][portalX] = 4;
+
+  // Cada aparicion usa una baldosa libre distinta, fuera de la entrada.
+  uint8_t floorCells[128];
+  int floorCount = 0;
+  for (int y = 1; y < DOOM_MAP_H - 1; ++y) {
+    for (int x = 1; x < DOOM_MAP_W - 1; ++x) {
+      if ((x > 5 || y > 5) && g_map[y][x] == 0 && x % 5 && y % 5) {
+        floorCells[floorCount++] = y * DOOM_MAP_W + x;
+      }
+    }
+  }
+  for (int i = 0; i < DOOM_MAX_ENEMIES + DOOM_MAX_ITEMS; ++i) {
+    const int pick = random(floorCount);
+    const int tile = floorCells[pick];
+    floorCells[pick] = floorCells[--floorCount];
+    const float x = tile % DOOM_MAP_W + 0.5f, y = tile / DOOM_MAP_W + 0.5f;
+    if (i < DOOM_MAX_ENEMIES) {
+      const uint8_t species = (i + g_level) % ABYSS_SPECIES_COUNT;
+      g_enemies[i] = {x, y, static_cast<int8_t>(species == 1 ? 3 : 2),
+                      true, 0, 0, species, 0, 0, false};
+    } else {
+      g_items[i - DOOM_MAX_ENEMIES] = {x, y, true};
+    }
   }
 }
 
@@ -145,22 +216,24 @@ inline uint16_t scaleRgb565(uint16_t c, uint8_t brightness) {
 }
 
 uint16_t sampleWallTex(uint8_t tile, int tx, int ty, bool darkSide, float dist) {
-  uint16_t base = g_theme.mid;
+  uint16_t base;
   if (tile == 1) {
-    bool seam = (tx == 0 || ty == 0 || ty == 8);
-    bool rivet = ((tx == 2 || tx == 13) && (ty == 2 || ty == 13));
-    base = seam ? g_theme.dark : (rivet ? g_theme.glow : g_theme.mid);
+    const bool trim = tx == 2 || tx == 13;
+    const bool panel = tx >= 4 && tx <= 11 && ty >= 2 && ty <= 13;
+    const bool trace = (tx == 4 && ty < 10) || (ty == 9 && tx >= 4 && tx < 11);
+    base = trace ? TEMPLE_CYAN : trim ? TEMPLE_METAL : panel ? TEMPLE_STONE : TEMPLE_VOID;
   } else if (tile == 2) {
-    int bx = (tx + ((ty >> 2) & 1) * 4) & 7;
-    bool mortar = ((ty & 3) == 0 || bx == 0);
-    base = mortar ? g_theme.dark : g_theme.dim;
+    const int dx = abs(tx - 7), dy = abs(ty - 7);
+    const bool sigil = dx * 2 + dy == 7 || (dx <= 1 && dy <= 1);
+    base = sigil ? TEMPLE_NEON : (ty == 1 || ty == 14) ? TEMPLE_METAL : TEMPLE_STONE;
   } else if (tile == 3) {
-    bool stripe = (((tx + ty) & 7) < 3) && (ty >= 4 && ty <= 11);
-    base = stripe ? g_theme.glow : g_theme.dim;
+    const bool conduit = tx == 3 || tx == 12 || (ty == 4 && tx > 3 && tx < 12);
+    const bool inset = tx > 4 && tx < 11 && ty > 6 && ty < 13;
+    base = conduit ? TEMPLE_NEON : inset ? TEMPLE_VOID : TEMPLE_METAL;
   } else {
-    bool frame = (tx <= 1 || tx >= 14 || ty <= 1 || ty >= 14);
-    bool glowCenter = (tx >= 5 && tx <= 10 && ty >= 5 && ty <= 10);
-    base = frame ? g_theme.bright : (glowCenter ? 0x07E0 : g_theme.dark);
+    const bool frame = tx <= 2 || tx >= 13 || ty <= 1 || ty >= 14;
+    const bool aperture = abs(tx - 7) * 2 + abs(ty - 7) < 9;
+    base = frame ? TEMPLE_CYAN : aperture ? TEMPLE_NEON : TEMPLE_VOID;
   }
 
   float fog = 1.0f - (dist * 0.085f);
@@ -170,44 +243,10 @@ uint16_t sampleWallTex(uint8_t tile, int tx, int ty, bool darkSide, float dist) 
   return scaleRgb565(base, static_cast<uint8_t>(fog * 255.0f));
 }
 
-uint8_t creaturePixel(int x, int y, uint8_t species, bool frame, bool attacking) {
-  // El Vigia, la Medusa y la Mascara.
-  static const char art[3][16][17] = {
-    {
-      "......2222......", "....22111122....", "...2111111112...", "..211333311112..",
-      "..211333311112..", "..211111111112..", "...2112222112...", "....11222211....",
-      "...2112112112...", "..211.2112.112..", "..11..2112..11..", ".11...2112...11.",
-      ".12...2..2...21.", "..2..22..22..2..", ".....2....2.....", "................"
-    }, {
-      ".......22.......", "......2112......", "...2.211112.2...", "..222133312222..",
-      ".21111333111112.", "..221111111122..", "...2221111222...", ".22..212212..22.",
-      ".1..212..212..1.", "....12....21....", "...12.1221.21...", "...1..2..2..1...",
-      "..1..2....2..1..", ".....2....2.....", "................", "................"
-    }, {
-      "...2...22...2...", "..221221122122..", "..211111111112..", ".21133113311112.",
-      ".21133113311112.", ".21111111111112.", "..222133312222..", "...2111111112...",
-      "...2112112112...", "..211.2112.112..", ".211..2112..112.", ".11..211112..11.",
-      ".2...21..12...2.", ".....12..21.....", "....22....22....", "................"
-    }
-  };
-
-  if (y >= 8 && frame) {
-    if (x < 6) ++x;
-    else if (x > 9) --x;
-  }
-  const char pixel = art[species][y][x];
-  if (pixel == '3' && frame && !attacking && y == 4) return 1;
-  return pixel == '.' ? 0 : pixel - '0';
-}
-
-uint8_t itemPixel(int x, int y, uint8_t type) {
-  if (x < 3 || x > 12 || y < 5 || y > 13) return 0;
-  if (x == 3 || x == 12 || y == 5 || y == 13) return 2;
-  if (type == 1) {
-    if ((x >= 7 && x <= 8 && y >= 7 && y <= 11) || (y == 9 && x >= 5 && x <= 10)) return 3;
-    return 1;
-  }
-  if (y == 8 || y == 11) return 3;
+uint8_t itemPixel(int x, int y) {
+  if (x < 5 || x > 26 || y < 19 || y > 29) return 0;
+  if (x == 5 || x == 26 || y == 19 || y == 29) return 2;
+  if ((x >= 14 && x <= 17) || (y >= 23 && y <= 25 && x >= 10 && x <= 21)) return 3;
   return 1;
 }
 
@@ -221,8 +260,8 @@ void drawHud() {
   snprintf(topBuf, sizeof(topBuf), "ENTES:%d/%d", g_kills, DOOM_MAX_ENEMIES);
   g_tft.setCursor(166, 7);
   printEs(topBuf, g_theme.glow, 1);
-  g_tft.setCursor(262, 7);
-  printEs("[B]Salir", g_theme.dim, 1);
+  g_tft.setCursor(232, 7);
+  printEs("[SELECT] Salir", g_theme.dim, 1);
 
   g_tft.fillRect(0, 202, SCREEN_W, 38, g_theme.bg);
   g_tft.drawFastHLine(0, 202, SCREEN_W, g_theme.bright);
@@ -233,15 +272,15 @@ void drawHud() {
   g_tft.setCursor(8, 208);
   printEs(hudBuf, hpCol, 2);
 
-  snprintf(hudBuf, sizeof(hudBuf), "BALAS:%2d", g_ammo);
-  g_tft.setCursor(116, 208);
-  printEs(hudBuf, g_ammo == 0 ? 0xF800 : g_theme.bright, 2);
+  g_tft.setCursor(105, 210);
+  printEs(g_dashReady ? "[B] Dash listo" : "[B] Recargando",
+          g_dashReady ? g_theme.bright : g_theme.mid, 1);
 
   g_tft.setCursor(236, 207);
   snprintf(hudBuf, sizeof(hudBuf), "NIVEL %lu", static_cast<unsigned long>(g_level));
   printEs(hudBuf, g_theme.mid, 1);
   g_tft.setCursor(236, 217);
-  printEs("[A]Dispara", g_theme.dim, 1);
+  printEs("[A] Katana", g_theme.dim, 1);
 
   g_tft.setCursor(6, 229);
   printEs("Arr/Ab: mover  Izq/Der: girar  START: mapa", g_theme.dim, 1);
@@ -266,51 +305,31 @@ void drawEndOverlay(bool victory) {
   g_tft.setCursor(bx + 36, by + 64);
   printEs(victory ? "[A] Siguiente nivel" : "[A] Nueva partida", g_theme.glow, 1);
   g_tft.setCursor(bx + 36, by + 82);
-  printEs("[B] Volver al menú", g_theme.mid, 1);
+  printEs("[SELECT] Volver al menú", g_theme.mid, 1);
 }
 
-void fireShotgun() {
-  const uint32_t now = millis();
-  if (g_ammo <= 0 || (now - g_lastShotMs) < 260) return;
-  g_lastShotMs = now;
-  g_ammo--;
-  g_gunRecoil = 5;
+void strikeKatana(uint32_t now) {
+  for (auto& enemy : g_enemies) {
+    if (!enemy.alive) continue;
+    const float dx = enemy.x - g_pX, dy = enemy.y - g_pY;
+    const float forward = dx * g_pDirX + dy * g_pDirY;
+    const float side = fabsf(dx * g_pDirY - dy * g_pDirX);
+    if (forward <= 0 || side > forward * 0.9f || dx * dx + dy * dy > 1.55f * 1.55f ||
+        !clearPath(g_pX, g_pY, enemy.x, enemy.y)) continue;
 
-  int bestIdx = -1;
-  float bestDist = 999.0f;
-  for (int i = 0; i < DOOM_MAX_ENEMIES; ++i) {
-    if (!g_enemies[i].alive) continue;
-    const float dx = g_enemies[i].x - g_pX;
-    const float dy = g_enemies[i].y - g_pY;
-    const float fwd = dx * g_pDirX + dy * g_pDirY;
-    if (fwd <= 0.25f || fwd > 9.0f) continue;
-    const float side = fabsf(dx * (-g_pDirY) + dy * g_pDirX);
-    if (side < 0.45f && fwd < bestDist &&
-        clearPath(g_pX, g_pY, g_enemies[i].x, g_enemies[i].y)) {
-      bestDist = fwd;
-      bestIdx = i;
-    }
-  }
-
-  if (bestIdx >= 0) {
-    g_enemies[bestIdx].hp--;
-    g_enemies[bestIdx].hurtFrames = 4;
-    const float pushX = g_enemies[bestIdx].x + g_pDirX * 0.22f;
-    const float pushY = g_enemies[bestIdx].y + g_pDirY * 0.22f;
-    if (canWalk(pushX, pushY)) {
-      g_enemies[bestIdx].x = pushX;
-      g_enemies[bestIdx].y = pushY;
-    }
-    if (g_enemies[bestIdx].hp <= 0) {
-      g_enemies[bestIdx].alive = false;
-      g_kills++;
-      Serial.printf("[Lily DOOM] Ente eliminado (%d/%d)\n", g_kills, DOOM_MAX_ENEMIES);
+    --enemy.hp;
+    enemy.hurtFrames = 4;
+    if (enemy.hp <= 0) {
+      enemy.alive = false;
+      enemy.deathMs = now;
+      ++g_kills;
+      Serial.printf("[Lily DOOM] Ente eliminado con katana (%d/%d)\n", g_kills, DOOM_MAX_ENEMIES);
     }
   }
   drawHud();
 }
 
-void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash, bool frame = false, bool attacking = false) {
+void drawSprite(float sx, float sy, const DoomEnemy* enemy, uint32_t now) {
   const float relX = sx - g_pX;
   const float relY = sy - g_pY;
   const float invDet = 1.0f / (g_pPlaneX * g_pDirY - g_pDirX * g_pPlaneY);
@@ -319,13 +338,21 @@ void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash,
   if (transY <= 0.2f) return;
 
   const int screenX = static_cast<int>((DOOM_W / 2.0f) * (1.0f + transX / transY));
-  int spriteH = abs(static_cast<int>(DOOM_H / transY));
-  if (spriteH > DOOM_H * 2) spriteH = DOOM_H * 2;
-  int spriteW = spriteH;
-
-  const int bob = isEnemy && param == 1 && frame ? spriteH / 14 : 0;
-  int drawStartY = -spriteH / 2 + DOOM_H / 2 - bob;
-  int drawEndY   =  spriteH / 2 + DOOM_H / 2 - bob;
+  const uint32_t deathAge = enemy && !enemy->alive ? now - enemy->deathMs : 0;
+  const bool charging = enemy && enemy->alive && enemy->winding;
+  const uint32_t strikeAge = enemy && enemy->lastAtkMs ? now - enemy->lastAtkMs : 1000;
+  const int phase = enemy ? (now / 90 + enemy->species) & 7 : 0;
+  constexpr int wave[] = {0, 2, 3, 2, 0, -2, -3, -2};
+  const int pulse = charging ? static_cast<int>(now - enemy->windupMs) * 10 / WINDUP_MS : 0;
+  const int lunge = enemy && enemy->alive && strikeAge < 190 ? (190 - strikeAge) / 13 : 0;
+  const int scale = 100 + lunge - pulse - static_cast<int>(deathAge / 21);
+  const int spriteH = constrain(static_cast<int>(DOOM_H / transY * scale / 100), 1, DOOM_H * 2);
+  const int spriteW = spriteH * (100 + pulse + lunge / 2) / 100;
+  const bool floating = enemy && (enemy->species == 1 || enemy->species == 4);
+  const int bob = enemy && enemy->alive ? spriteH * wave[phase] / (floating ? 29 : 70) : 0;
+  const int sink = deathAge ? spriteH * deathAge / (DEATH_MS * 3) : 0;
+  int drawStartY = -spriteH / 2 + DOOM_H / 2 - bob + sink;
+  int drawEndY   =  spriteH / 2 + DOOM_H / 2 - bob + sink;
   if (drawStartY < 0) drawStartY = 0;
   if (drawEndY >= DOOM_H) drawEndY = DOOM_H - 1;
 
@@ -341,33 +368,121 @@ void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash,
 
   for (int stripe = drawStartX; stripe <= drawEndX; ++stripe) {
     if (transY >= g_zBuf[stripe]) continue;
-    const int texX = ((stripe - (-spriteW / 2 + screenX)) * 16) / spriteW;
-    if (texX < 0 || texX >= 16) continue;
+    const int texX = ((stripe + spriteW / 2 - screenX) * ABYSS_SPRITE_SIZE) / spriteW;
+    if (texX < 0 || texX >= ABYSS_SPRITE_SIZE) continue;
 
     for (int y = drawStartY; y <= drawEndY; ++y) {
-      const int d = (y + bob) * 256 - DOOM_H * 128 + spriteH * 128;
-      const int texY = ((d * 16) / spriteH) / 256;
-      if (texY < 0 || texY >= 16) continue;
+      const int texY = ((y + bob - sink + spriteH / 2 - DOOM_H / 2) *
+                        ABYSS_SPRITE_SIZE) / spriteH;
+      if (texY < 0 || texY >= ABYSS_SPRITE_SIZE) continue;
 
-      const uint8_t pix = isEnemy ? creaturePixel(texX, texY, param, frame, attacking) : itemPixel(texX, texY, param);
-      if (pix == 0) continue;
-
-      uint16_t col = 0;
-      if (isEnemy) {
-        constexpr uint16_t bodies[] = {0x64B2, 0xB1B9, 0xA54C};
-        if (hurtFlash) col = 0xFFFF;
-        else if (pix == 3) col = attacking ? 0xF983 : 0xFF53;
-        else col = scaleRgb565(bodies[param], pix == 2 ? br / 2 : br);
+      uint16_t col;
+      if (enemy) {
+        int artX = texX;
+        if (enemy->alive) {
+          const int bend = floating ? wave[(phase + texY / 6) & 7] :
+                                     wave[(phase + (texY >= 18 ? 4 : 0)) & 7] / 2;
+          artX += bend + (texY < 15 ? lunge / 5 - pulse / 5 : 0);
+        }
+        if (artX < 0 || artX >= ABYSS_SPRITE_SIZE) continue;
+        if (deathAge && (texX * 17 + texY * 29) % DEATH_MS < deathAge) continue;
+        const int index = ABYSS_SPRITES[enemy->species][texY][artX] - '0';
+        if (!index) continue;
+        constexpr uint16_t violet[] = {0, 0x1808, 0x300E, 0x4815, 0x681B, 0x925F, 0xB39F, 0xDD7F};
+        const int shade = (charging || lunge) && index < 6 ? index + 2 : index;
+        col = enemy->alive && enemy->hurtFrames ? violet[7] : scaleRgb565(violet[shade], br);
+        if (charging && index >= 5 && ((now / (pulse < 6 ? 110 : 65)) & 1)) col = violet[7];
       } else {
-        if (param == 1) col = (pix == 3) ? 0xF800 : ((pix == 2) ? g_theme.dim : 0xFFFF);
-        else col = (pix == 3) ? 0xFFE0 : ((pix == 2) ? g_theme.dark : g_theme.bright);
+        const uint8_t pixel = itemPixel(texX, texY);
+        if (!pixel) continue;
+        col = pixel == 3 ? 0xF800 : (pixel == 2 ? g_theme.dim : 0xFFFF);
       }
       g_fb[y * DOOM_W + stripe] = col;
     }
   }
+  if (charging || lunge) {
+    const int radius = constrain(spriteW / 3 + lunge, 5, 46);
+    const int floorY = constrain(drawEndY - 3, DOOM_H / 2 + 3, DOOM_H - 5);
+    const int filled = radius * (charging ? pulse : 10) / 10;
+    for (int dx = -radius; dx <= radius; ++dx) {
+      const int x = screenX + dx;
+      if (x < 0 || x >= DOOM_W || transY >= g_zBuf[x]) continue;
+      const int y = floorY - dx * dx / (radius * 3);
+      g_fb[y * DOOM_W + x] = abs(dx) <= filled ? TEMPLE_NEON : TEMPLE_METAL;
+    }
+  }
+  if (deathAge || lunge) {
+    const int power = deathAge ? deathAge / 28 : 15 - lunge;
+    const int coreY = (drawEndY + drawStartY) / 2;
+    for (int i = 0; i < 11; ++i) {
+      const int dx = ((i * 13) % 11 - 5) * (3 + power) / 3;
+      const int dy = ((i * 53) % 17 - 8) * (2 + power) / 3 + power / 2;
+      const int x = screenX + dx, y = coreY + dy;
+      if (x >= 0 && x < DOOM_W && y >= 0 && y < DOOM_H && transY < g_zBuf[x]) {
+        g_fb[y * DOOM_W + x] = i % 3 ? TEMPLE_NEON : 0xDD7F;
+      }
+    }
+  }
 }
 
-void drawWeaponAndOverlay() {
+void weaponLine(int x0, int y0, int x1, int y1, uint16_t color) {
+  const int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+  const int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  int error = dx + dy;
+  while (true) {
+    if (x0 >= 0 && x0 < DOOM_W && y0 >= 0 && y0 < DOOM_H) g_fb[y0 * DOOM_W + x0] = color;
+    if (x0 == x1 && y0 == y1) break;
+    const int twice = 2 * error;
+    if (twice >= dy) { error += dy; x0 += sx; }
+    if (twice <= dx) { error += dx; y0 += sy; }
+  }
+}
+
+void drawKatana(uint32_t now) {
+  // Poses: guardia, anticipacion, corte diagonal, seguimiento y regreso.
+  struct Pose { int x, y, angle; };
+  constexpr Pose poses[] = {{137, 81, -120}, {147, 71, -83}, {117, 65, -139},
+                            {71, 73, -174}, {56, 91, -164}, {137, 81, -120}};
+  const uint32_t age = now - g_lastSwingMs;
+  const float progress = age < KATANA_SWING_MS ? age * 5.0f / KATANA_SWING_MS : 0;
+  const int index = static_cast<int>(progress);
+  const float f = progress - index;
+  const Pose& a = poses[index];
+  const Pose& b = poses[index + 1];
+  const int x = lroundf(a.x + (b.x - a.x) * f);
+  const int y = lroundf(a.y + (b.y - a.y) * f) + (g_dashRemaining > 0 ? 5 : 0);
+  const float angle = (a.angle + (b.angle - a.angle) * f) * 0.017453293f;
+  const float ux = cosf(angle), uy = sinf(angle);
+  const float vx = -uy, vy = ux;
+  auto line = [&](int from, int across, int to, int endAcross, uint16_t color) {
+    weaponLine(lroundf(x + ux * from + vx * across), lroundf(y + uy * from + vy * across),
+               lroundf(x + ux * to + vx * endAcross), lroundf(y + uy * to + vy * endAcross), color);
+  };
+
+  if (index >= 1 && index <= 3) {
+    for (int i = 0; i < 4; ++i) {
+      const float trail = angle + (i + 1) * 0.16f;
+      const int endX = lroundf(x + cosf(trail) * (57 + i * 2));
+      const int endY = lroundf(y + sinf(trail) * (57 + i * 2));
+      weaponLine(endX, endY, lroundf(endX + vx * 10), lroundf(endY + vy * 10),
+                 i == 0 ? TEMPLE_CYAN : i == 1 ? TEMPLE_NEON : TEMPLE_METAL);
+    }
+  }
+
+  for (int w = -3; w <= 3; ++w) {
+    line(-15, w, -2, w, abs(w) == 3 ? TEMPLE_METAL : TEMPLE_VOID);
+    line(2, w, 43, w, w == -3 ? 0xDEBF : w == -2 ? TEMPLE_CYAN :
+                         w == 2 ? TEMPLE_NEON : w == 3 ? TEMPLE_METAL : 0x6B39);
+    line(43, w, 52, -3, w <= -2 ? 0xDEBF : TEMPLE_METAL);
+  }
+  for (int grip = -13; grip < -3; grip += 4) line(grip, -2, grip + 2, 2, TEMPLE_NEON);
+  line(-15, -3, -15, 3, TEMPLE_CYAN);
+  line(-1, -7, 1, 7, TEMPLE_METAL);
+  line(0, -7, 2, 7, TEMPLE_NEON);
+  line(3, 0, 9, 0, TEMPLE_CYAN);
+}
+
+void drawWeaponAndOverlay(uint32_t now) {
   const int cx = DOOM_W / 2;
   const int cy = DOOM_H / 2;
   for (int i = -3; i <= 3; ++i) {
@@ -375,31 +490,13 @@ void drawWeaponAndOverlay() {
     g_fb[(cy + i) * DOOM_W + cx] = g_theme.glow;
   }
 
-  const int kick = (g_gunRecoil > 0) ? (g_gunRecoil * 2) : 0;
-  const int gy = DOOM_H - 24 + kick;
-
-  if (g_gunRecoil >= 4) {
-    for (int y = gy - 10; y < gy; ++y) {
-      for (int x = cx - 8; x <= cx + 8; ++x) {
-        if (y >= 0 && y < DOOM_H && ((x + y) & 1)) {
-          g_fb[y * DOOM_W + x] = 0xFFE0;
-        }
+  drawKatana(now);
+  if (g_dashRemaining > 0) {
+    for (int y = 14; y < 80; y += 13) {
+      for (int x = 2; x < 13; ++x) {
+        g_fb[y * DOOM_W + x] = 0x925F;
+        g_fb[y * DOOM_W + DOOM_W - 1 - x] = 0x925F;
       }
-    }
-  }
-
-  for (int y = gy; y < DOOM_H; ++y) {
-    const int ly = y - gy;
-    const int halfW = (ly < 10) ? 5 : 11;
-    for (int x = cx - halfW; x <= cx + halfW; ++x) {
-      if (y < 0 || y >= DOOM_H || x < 0 || x >= DOOM_W) continue;
-      uint16_t c = g_theme.dim;
-      if (ly < 10) {
-        c = (x == cx) ? g_theme.bg : ((x == cx - 2 || x == cx + 2) ? g_theme.bright : g_theme.mid);
-      } else {
-        c = (ly == 10 || x == cx - halfW || x == cx + halfW) ? g_theme.bright : g_theme.dark;
-      }
-      g_fb[y * DOOM_W + x] = c;
     }
   }
 
@@ -409,7 +506,7 @@ void drawWeaponAndOverlay() {
     for (int my = 0; my < DOOM_MAP_H; ++my) {
       for (int mx = 0; mx < DOOM_MAP_W; ++mx) {
         const uint8_t tile = g_map[my][mx];
-        const uint16_t c = (tile == 4) ? 0x07E0 : (tile ? g_theme.dim : g_theme.bg);
+        const uint16_t c = (tile == 4) ? TEMPLE_CYAN : (tile ? TEMPLE_VOID : TEMPLE_METAL);
         for (int dy = 0; dy < 2; ++dy) {
           for (int dx = 0; dx < 2; ++dx) {
             g_fb[(my0 + my * 2 + dy) * DOOM_W + (mx0 + mx * 2 + dx)] = c;
@@ -421,11 +518,32 @@ void drawWeaponAndOverlay() {
       if (!g_enemies[i].alive) continue;
       int ex = mx0 + static_cast<int>(g_enemies[i].x * 2);
       int ey = my0 + static_cast<int>(g_enemies[i].y * 2);
-      if (ex >= 0 && ex < DOOM_W && ey >= 0 && ey < DOOM_H) g_fb[ey * DOOM_W + ex] = 0xF800;
+      if (ex >= 0 && ex < DOOM_W && ey >= 0 && ey < DOOM_H) g_fb[ey * DOOM_W + ex] = g_enemies[i].winding ? ATTACK_WARNING : TEMPLE_NEON;
     }
     int px = mx0 + static_cast<int>(g_pX * 2);
     int py = my0 + static_cast<int>(g_pY * 2);
     if (px >= 0 && px < DOOM_W && py >= 0 && py < DOOM_H) g_fb[py * DOOM_W + px] = 0xFFFF;
+  }
+
+  int warning = -1;
+  for (const auto& enemy : g_enemies) {
+    if (enemy.alive && enemy.winding) {
+      const int progress = (now - enemy.windupMs) * 32 / WINDUP_MS;
+      if (progress > warning) warning = progress;
+    }
+  }
+  if (warning >= 0) {
+    // Indicador global: se llena al preparar el golpe, incluso fuera de camara.
+    for (int x = 62; x <= 97; ++x) {
+      g_fb[5 * DOOM_W + x] = TEMPLE_NEON;
+      g_fb[9 * DOOM_W + x] = TEMPLE_NEON;
+      for (int y = 6; y < 9; ++y) {
+        g_fb[y * DOOM_W + x] = x - 63 < warning ? ATTACK_WARNING : TEMPLE_VOID;
+      }
+    }
+    for (int y = 12; y < 25; ++y) {
+      if (y < 21 || y > 22) g_fb[y * DOOM_W + 80] = ATTACK_WARNING;
+    }
   }
 
   if (g_hurtFlash > 0) {
@@ -445,6 +563,20 @@ void updateAndRenderFrame() {
   float dt = (now - g_lastFrameMs) / 1000.0f;
   if (dt > 0.1f) dt = 0.1f;
   g_lastFrameMs = now;
+
+  const bool dashing = g_dashRemaining > 0.0f;
+  if (dashing) {
+    const float distance = fminf(dt * 10.0f, g_dashRemaining);
+    g_dashRemaining -= distance;
+    const int steps = 1 + static_cast<int>(distance / 0.12f);
+    const float step = distance / steps;
+    for (int i = 0; i < steps; ++i) {
+      const float x = g_pX + g_dashX * step;
+      const float y = g_pY + g_dashY * step;
+      if (canWalk(x, g_pY)) g_pX = x;
+      if (canWalk(g_pX, y)) g_pY = y;
+    }
+  }
 
   const float rotSpd = 2.3f * dt;
   const int move = static_cast<int>(inputButtonHeld(BTN_UP)) - inputButtonHeld(BTN_DOWN);
@@ -481,49 +613,35 @@ void updateAndRenderFrame() {
     g_pPlaneY = oldPlX * s + g_pPlaneY * c;
   }
 
-  const bool fireHigh = (digitalRead(BTN_A) == HIGH);
-  if (g_prevFireHigh && !fireHigh) {
-    fireShotgun();
+  if (g_katanaPending && now - g_lastSwingMs >= KATANA_IMPACT_MS) {
+    g_katanaPending = false;
+    strikeKatana(now);
   }
-  g_prevFireHigh = fireHigh;
 
-  bool hudDirty = false;
-  for (int i = 0; i < DOOM_MAX_ITEMS; ++i) {
-    if (!g_items[i].active) continue;
-    const float dx = g_items[i].x - g_pX;
-    const float dy = g_items[i].y - g_pY;
-    if ((dx * dx + dy * dy) < 0.45f) {
-      if (g_items[i].type == 1 && g_hp < 100) {
-        g_hp += 25;
-        if (g_hp > 100) g_hp = 100;
-        g_items[i].active = false;
-        hudDirty = true;
-      } else if (g_items[i].type == 2) {
-        g_ammo += 8;
-        g_items[i].active = false;
-        hudDirty = true;
-      }
+  const bool ready = now - g_lastDashMs >= DASH_COOLDOWN_MS;
+  bool hudDirty = ready != g_dashReady;
+  g_dashReady = ready;
+  for (auto& item : g_items) {
+    if (!item.active || g_hp >= 100) continue;
+    const float dx = item.x - g_pX, dy = item.y - g_pY;
+    if (dx * dx + dy * dy < 0.45f) {
+      g_hp = g_hp > 75 ? 100 : g_hp + 25;
+      item.active = false;
+      hudDirty = true;
     }
   }
 
-  for (int i = 0; i < DOOM_MAX_ENEMIES; ++i) {
-    if (!g_enemies[i].alive) continue;
-    if (g_enemies[i].hurtFrames > 0) g_enemies[i].hurtFrames--;
-    const float dx = g_pX - g_enemies[i].x;
-    const float dy = g_pY - g_enemies[i].y;
+  for (auto& enemy : g_enemies) {
+    if (!enemy.alive) continue;
+    if (enemy.hurtFrames) --enemy.hurtFrames;
+    const float dx = g_pX - enemy.x, dy = g_pY - enemy.y;
     const float distSq = dx * dx + dy * dy;
-    if (distSq < 36.0f && distSq > 0.85f) {
-      const float invD = 1.0f / sqrtf(distSq);
-      const float step = 0.85f * dt;
-      const float ex = g_enemies[i].x + dx * invD * step;
-      const float ey = g_enemies[i].y + dy * invD * step;
-      if (canWalk(ex, g_enemies[i].y)) g_enemies[i].x = ex;
-      if (canWalk(g_enemies[i].x, ey)) g_enemies[i].y = ey;
-    } else if (distSq <= 0.85f && (now - g_enemies[i].lastAtkMs) >= 950 &&
-               clearPath(g_enemies[i].x, g_enemies[i].y, g_pX, g_pY)) {
-      g_enemies[i].lastAtkMs = now;
-      g_hp -= 12;
-      if (g_hp < 0) g_hp = 0;
+    if (enemy.winding) {
+      if (now - enemy.windupMs < WINDUP_MS) continue;
+      enemy.winding = false;
+      enemy.lastAtkMs = now;
+      if (dashing || distSq > 1.13f * 1.13f || !clearPath(enemy.x, enemy.y, g_pX, g_pY)) continue;
+      g_hp = g_hp > 12 ? g_hp - 12 : 0;
       g_hurtFlash = 4;
       hudDirty = true;
       if (g_hp == 0) {
@@ -533,10 +651,18 @@ void updateAndRenderFrame() {
         Serial.println(F("[Lily DOOM] Fin de la partida."));
         return;
       }
+    } else if (distSq <= 0.85f && now - enemy.lastAtkMs >= 850 &&
+               clearPath(enemy.x, enemy.y, g_pX, g_pY)) {
+      enemy.windupMs = now;
+      enemy.winding = true;
+    } else if (distSq < 36.0f && distSq > 0.85f && now - enemy.lastAtkMs >= 230) {
+      const float step = 0.85f * dt / sqrtf(distSq);
+      const float ex = enemy.x + dx * step, ey = enemy.y + dy * step;
+      if (canWalk(ex, enemy.y)) enemy.x = ex;
+      if (canWalk(enemy.x, ey)) enemy.y = ey;
     }
   }
 
-  if (g_gunRecoil > 0) g_gunRecoil--;
   if (g_hurtFlash > 0) g_hurtFlash--;
 
   // 1. Techo y piso con degradado de profundidad
@@ -544,13 +670,17 @@ void updateAndRenderFrame() {
     uint16_t rowCol = 0x0000;
     if (y < DOOM_H / 2) {
       const uint8_t b = static_cast<uint8_t>((DOOM_H / 2 - y) * 2);
-      rowCol = scaleRgb565(g_theme.dark, b);
+      rowCol = scaleRgb565(TEMPLE_VOID, b);
     } else {
       const uint8_t b = static_cast<uint8_t>((y - DOOM_H / 2) * 3);
-      rowCol = scaleRgb565(g_theme.dim, b);
+      rowCol = scaleRgb565(TEMPLE_STONE, b);
     }
     uint16_t* dst = &g_fb[y * DOOM_W];
-    for (int x = 0; x < DOOM_W; ++x) dst[x] = rowCol;
+    for (int x = 0; x < DOOM_W; ++x) {
+      const int depth = y - DOOM_H / 2;
+      const bool seam = depth > 5 && (depth % 12 == 0 || (abs(x - DOOM_W / 2) * 8) % depth < 2);
+      dst[x] = seam ? scaleRgb565(TEMPLE_CYAN, depth + 12) : rowCol;
+    }
   }
 
   // 2. Raycasting DDA columna por columna (160 rayos)
@@ -622,7 +752,7 @@ void updateAndRenderFrame() {
     list[count++] = { dx * dx + dy * dy, false, i };
   }
   for (int i = 0; i < DOOM_MAX_ENEMIES; ++i) {
-    if (!g_enemies[i].alive) continue;
+    if (!g_enemies[i].alive && now - g_enemies[i].deathMs >= DEATH_MS) continue;
     float dx = g_enemies[i].x - g_pX, dy = g_enemies[i].y - g_pY;
     list[count++] = { dx * dx + dy * dy, true, i };
   }
@@ -636,17 +766,15 @@ void updateAndRenderFrame() {
   for (int i = 0; i < count; ++i) {
     if (list[i].isEnemy) {
       const DoomEnemy& e = g_enemies[list[i].idx];
-      const bool attacking = e.lastAtkMs != 0 && now - e.lastAtkMs < 220;
-      const bool frame = attacking || ((now / 170 + list[i].idx) & 1);
-      drawSprite(e.x, e.y, true, e.species, e.hurtFrames > 0, frame, attacking);
+      drawSprite(e.x, e.y, &e, now);
     } else {
       const DoomItem& it = g_items[list[i].idx];
-      drawSprite(it.x, it.y, false, it.type, false);
+      drawSprite(it.x, it.y, nullptr, now);
     }
   }
 
   // 4. Arma, mira y minimapa
-  drawWeaponAndOverlay();
+  drawWeaponAndOverlay(now);
 
   // 5. Blit único escalado 2x (160x90 -> 320x180) enviando 2 filas a la vez (0 parpadeo)
   g_tft.startWrite();
@@ -685,17 +813,18 @@ static void startLevel() {
   g_pPlaneX = 0.0f;
   g_pPlaneY = 0.66f;
   g_hp = 100;
-  g_ammo = 24;
   g_kills = 0;
-  g_gunRecoil = 0;
   g_hurtFlash = 0;
   g_dead = false;
   g_win = false;
   g_startMs = millis();
   g_lastFrameMs = g_startMs;
-  g_prevFireHigh = (digitalRead(BTN_A) == HIGH);
 
-  g_lastShotMs = g_startMs - 260;
+  g_lastSwingMs = g_startMs - KATANA_COOLDOWN_MS;
+  g_katanaPending = false;
+  g_lastDashMs = g_startMs - DASH_COOLDOWN_MS;
+  g_dashRemaining = 0;
+  g_dashReady = true;
   generateLevel();
   doomRenderFull();
   Serial.printf("[Lily DOOM] Nivel %lu generado. Avanzar GPIO %d, retroceder GPIO %d.\n",
@@ -708,7 +837,7 @@ void doomStart() {
 }
 
 bool doomHandleButton(int pin) {
-  if (pin == BTN_B) return true;
+  if (pin == BTN_SELECT) return true;
 
   if (g_dead || g_win) {
     if (pin == BTN_A || pin == BTN_START) {
@@ -722,6 +851,17 @@ bool doomHandleButton(int pin) {
     return false;
   }
 
+  if (pin == BTN_A && millis() - g_lastSwingMs >= KATANA_COOLDOWN_MS) {
+    g_lastSwingMs = millis();
+    g_katanaPending = true;
+  }
+  if (pin == BTN_B && millis() - g_lastDashMs >= DASH_COOLDOWN_MS) {
+    const float direction = inputButtonHeld(BTN_DOWN) ? -1.0f : 1.0f;
+    g_dashX = direction * g_pDirX;
+    g_dashY = direction * g_pDirY;
+    g_dashRemaining = 1.75f;
+    g_lastDashMs = millis();
+  }
   if (pin == BTN_START) {
     g_showMap = !g_showMap;
   }
