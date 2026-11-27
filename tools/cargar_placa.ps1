@@ -7,7 +7,8 @@ param(
     [string]$ArduinoData,
     [string]$ArduinoLibraries,
     [switch]$SoloCompilar,
-    [switch]$PruebaPantalla
+    [switch]$PruebaPantalla,
+    [switch]$SoloLogs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,7 @@ $null = New-Item -ItemType Directory -Force -Path $logs
 $stamp = '{0:yyyyMMdd-HHmmss}-{1}' -f (Get-Date), $PID
 $runLog = Join-Path $logs "carga_esp32_$stamp.log"
 $serialLog = Join-Path $logs "esp32_serial_$stamp.log"
+$latestSerialLog = Join-Path $logs 'esp32_serial_latest.log'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $fqbn = 'esp32:esp32:esp32s3'
 
@@ -124,6 +126,7 @@ try {
         $cliConfig = @('--config-file', $ideConfig)
     }
     $corePath = 'packages\esp32\hardware\esp32'
+    $defaultArduinoData = "C:\Users\LilianaRoksanneD$([char]0x00ED)az\AppData\Local\Arduino15"
     if ($ArduinoData) {
         $env:ARDUINO_DIRECTORIES_DATA = (Resolve-Path -LiteralPath $ArduinoData).Path
         if (!(Test-Path -LiteralPath (Join-Path $env:ARDUINO_DIRECTORIES_DATA $corePath))) {
@@ -131,6 +134,7 @@ try {
         }
     } else {
         $candidates = @(
+            $defaultArduinoData
             $env:ARDUINO_DIRECTORIES_DATA
             (Join-Path $env:USERPROFILE 'AppData\Local\Arduino15')
             (Join-Path $env:LOCALAPPDATA 'Arduino15')
@@ -139,6 +143,7 @@ try {
             $_ -and (Test-Path -LiteralPath (Join-Path $_ $corePath))
         } | Select-Object -First 1
         if ($installed) { $env:ARDUINO_DIRECTORIES_DATA = $installed }
+        else { $env:ARDUINO_DIRECTORIES_DATA = $defaultArduinoData }
     }
     Write-Carga "Lanzador: $PSCommandPath"
     Write-Carga "Arduino CLI: $cli"
@@ -151,6 +156,33 @@ try {
     Write-Carga "Puerto seleccionado: $($target.Address)"
     if ($SoloDetectar) { exit 0 }
 
+    # El USB nativo necesita CDC en el arranque para que Serial siga en ese conector.
+    if ($target.Native) { $fqbn += ':USBMode=hwcdc,CDCOnBoot=cdc' }
+
+    if ($SoloLogs) {
+        Write-Carga "Solo monitor de logs en $($target.Address) a 115200. Ctrl+C para cerrar."
+        Write-Carga "Registros: $serialLog y $latestSerialLog"
+        $writer = New-Object IO.StreamWriter($serialLog, $false, $utf8)
+        $latestWriter = New-Object IO.StreamWriter($latestSerialLog, $false, $utf8)
+        $writer.AutoFlush = $true
+        $latestWriter.AutoFlush = $true
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $cli @cliConfig monitor --fqbn $fqbn --port $target.Address --config baudrate=115200 --timestamp 2>&1 |
+                ForEach-Object {
+                    $line = [string]$_
+                    $writer.WriteLine($line)
+                    $latestWriter.WriteLine($line)
+                    Write-Host $line
+                }
+            if ($LASTEXITCODE -ne 0) { throw "El monitor termino con codigo $LASTEXITCODE. Revisa $runLog." }
+        } finally {
+            $writer.Dispose()
+            $latestWriter.Dispose()
+        }
+        exit 0
+    }
+
     $cores = & $cli @cliConfig core list
     $coreExit = $LASTEXITCODE
     $cores | ForEach-Object { Write-Carga ([string]$_) }
@@ -158,8 +190,6 @@ try {
         throw 'Arduino CLI no ve esp32:esp32. Usa -ArduinoData con la carpeta Arduino15 de la instalacion del IDE.'
     }
 
-    # El USB nativo necesita CDC en el arranque para que Serial siga en ese conector.
-    if ($target.Native) { $fqbn += ':USBMode=hwcdc,CDCOnBoot=cdc' }
     $build = Join-Path $root "build_real\usb-$stamp"
     Write-Carga "Compilando $sketchName para $fqbn..."
     if (!$ArduinoLibraries) {
@@ -188,16 +218,24 @@ try {
     Invoke-Arduino @('upload','--fqbn',$fqbn,'--port',$target.Address,'--input-dir',$build,'--verify',$sketch)
 
     $monitorPort = Wait-MonitorPort $target
-    Write-Carga "Monitor $monitorPort a 115200. Ctrl+C para cerrar. Registro: $serialLog"
+    Write-Carga "Monitor $monitorPort a 115200. Ctrl+C para cerrar. Registros: $serialLog y $latestSerialLog"
     $writer = New-Object IO.StreamWriter($serialLog, $false, $utf8)
+    $latestWriter = New-Object IO.StreamWriter($latestSerialLog, $false, $utf8)
     $writer.AutoFlush = $true
+    $latestWriter.AutoFlush = $true
     try {
         $ErrorActionPreference = 'Continue'
         & $cli @cliConfig monitor --fqbn $fqbn --port $monitorPort --config baudrate=115200 --timestamp 2>&1 |
-            ForEach-Object { $line = [string]$_; $writer.WriteLine($line); Write-Host $line }
+            ForEach-Object {
+                $line = [string]$_
+                $writer.WriteLine($line)
+                $latestWriter.WriteLine($line)
+                Write-Host $line
+            }
         if ($LASTEXITCODE -ne 0) { throw "El monitor termino con codigo $LASTEXITCODE. Revisa $serialLog." }
     } finally {
         $writer.Dispose()
+        $latestWriter.Dispose()
     }
 } catch {
     Write-Carga "ERROR: $($_.Exception.Message)"

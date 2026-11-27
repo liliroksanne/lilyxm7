@@ -12,13 +12,13 @@
 
 namespace {
 
-// Paleta Matrix (RGB565): negro puro y distintos niveles de verde fósforo
+// Paleta rosa suave sobre negro (nada cegante de noche en la Vitara)
 constexpr uint16_t COLOR_BG             = 0x0000; // Negro puro
-constexpr uint16_t COLOR_MATRIX_DARK    = 0x502A; // Rosa oscuro (rejilla / fondo suave)
-constexpr uint16_t COLOR_MATRIX_DIM     = 0x996F; // Rosa tenue (marcos y etiquetas secundarias)
-constexpr uint16_t COLOR_MATRIX_MID     = 0xCAD6; // Rosa medio (cabello / texto secundario)
-constexpr uint16_t COLOR_MATRIX_BRIGHT  = 0xF3DB; // Rosa fosforescente suave (principal)
-constexpr uint16_t COLOR_MATRIX_GLOW    = 0xFE1C; // Rosa claro (destello / alerta)
+constexpr uint16_t COLOR_MATRIX_DARK    = 0x2864; // Rosa muy oscuro (separadores)
+constexpr uint16_t COLOR_MATRIX_DIM     = 0x5949; // Rosa apagado (marcos y etiquetas)
+constexpr uint16_t COLOR_MATRIX_MID     = 0x9A90; // Rosa medio suave (texto secundario)
+constexpr uint16_t COLOR_MATRIX_BRIGHT  = 0xC394; // Rosa pastel suave (principal)
+constexpr uint16_t COLOR_MATRIX_GLOW    = 0xDC98; // Rosa claro suave (alerta)
 
 constexpr int16_t SCREEN_W = 320;
 constexpr int16_t SCREEN_H = 240;
