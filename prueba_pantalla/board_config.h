@@ -77,4 +77,4 @@ enum class ScreenId : uint8_t {
   DOOM = 4
 };
 
-constexpr uint8_t MENU_COUNT = 4; // 0=Temperatura, 1=Conexión, 2=Snake, 3=DOOM E1M1
+constexpr uint8_t MENU_COUNT = 4; // 0=Temperatura, 1=Conexión, 2=Snake, 3=Lily DOOM

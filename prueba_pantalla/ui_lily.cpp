@@ -208,7 +208,7 @@ void drawMenuItemsOnly(uint8_t menuIdx) {
     "Temperatura",
     "Estado de conexión",
     "Snake",
-    "DOOM E1M1"
+    "Lily DOOM"
   };
 
   for (uint8_t i = 0; i < MENU_COUNT; ++i) {

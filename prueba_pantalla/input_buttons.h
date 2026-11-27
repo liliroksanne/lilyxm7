@@ -6,3 +6,5 @@
 
 void inputButtonsInit();
 int inputButtonsPoll(); // Devuelve el GPIO recién pulsado o -1 si no hubo evento
+
+bool inputButtonHeld(int pin);

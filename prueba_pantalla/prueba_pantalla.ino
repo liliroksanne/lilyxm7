@@ -16,7 +16,7 @@
 //   - input_buttons.h / .cpp  : Lectura con antirrebote de los 10 botones
 //   - ui_lily.h / .cpp        : Menú, Temperatura, Conexión y chatbot Lily
 //   - game_snake.h / .cpp     : Minijuego Snake sin parpadeo
-//   - game_doom.h / .cpp      : Motor 3D Raycasting DOOM E1M1 Hangar
+//   - game_doom.h / .cpp      : Motor 3D Raycasting Lily DOOM
 // ============================================================================
 
 namespace {

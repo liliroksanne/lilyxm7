@@ -54,3 +54,10 @@ int inputButtonsPoll() {
   }
   return -1;
 }
+
+bool inputButtonHeld(int pin) {
+  for (const auto& button : g_buttons) {
+    if (button.pin == pin) return !button.stable;
+  }
+  return false;
+}

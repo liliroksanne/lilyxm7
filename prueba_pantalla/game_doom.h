@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Motor 3D Raycasting "DOOM E1M1 - HANGAR" (160x90 -> 320x180, sin microSD)
+// Motor 3D Raycasting "Lily DOOM" (160x90 -> 320x180, sin microSD)
 // ============================================================================
 
 void doomStart();

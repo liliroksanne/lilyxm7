@@ -1,6 +1,7 @@
 #include "game_doom.h"
 #include "board_config.h"
 #include "display_driver.h"
+#include "input_buttons.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -16,25 +17,8 @@ constexpr int DOOM_MAP_H = 16;
 constexpr int DOOM_MAX_ENEMIES = 6;
 constexpr int DOOM_MAX_ITEMS   = 4;
 
-// Mapa Nivel 1 (E1M1 Hangar): 1=Metal tech, 2=Ladrillo/Piedra, 3=Pilar alerta, 4=Puerta EXIT
-const uint8_t kDoomMap[DOOM_MAP_H][DOOM_MAP_W] = {
-  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
-  {1,0,0,0,0,0,1,0,0,0,0,0,2,0,4,1},
-  {1,0,3,0,0,0,1,0,0,3,0,0,2,0,0,1},
-  {1,0,0,0,0,0,0,0,0,0,0,0,2,0,0,1},
-  {1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1},
-  {1,1,0,1,1,1,1,2,2,0,2,2,2,2,1,1},
-  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
-  {1,0,2,2,0,0,0,3,0,0,3,0,0,2,0,1},
-  {1,0,2,0,0,0,0,0,0,0,0,0,0,2,0,1},
-  {1,0,0,0,0,0,0,3,0,0,3,0,0,0,0,1},
-  {1,1,1,0,1,1,0,0,0,0,0,0,1,1,1,1},
-  {1,0,0,0,0,1,0,0,0,0,0,0,1,0,0,1},
-  {1,0,3,0,0,0,0,0,2,0,0,0,0,0,0,1},
-  {1,0,0,0,0,1,0,0,2,0,0,0,1,0,0,1},
-  {1,0,0,0,0,1,0,0,0,0,0,0,1,0,0,1},
-  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
-};
+uint8_t g_map[DOOM_MAP_H][DOOM_MAP_W];
+uint32_t g_level = 1;
 
 struct DoomEnemy {
   float x, y;
@@ -42,6 +26,7 @@ struct DoomEnemy {
   bool alive;
   uint8_t hurtFrames;
   uint32_t lastAtkMs;
+  uint8_t species;
 };
 
 struct DoomItem {
@@ -54,7 +39,8 @@ uint16_t g_fb[DOOM_W * DOOM_H];
 uint16_t g_rowBuf[SCREEN_W * 2]; // Dos filas de 320 px para blit 2x sin doble swap
 float g_zBuf[DOOM_W];
 
-float g_pX = 2.5f, g_pY = 2.5f;
+constexpr float START_X = 2.5f, START_Y = 2.5f;
+float g_pX = START_X, g_pY = START_Y;
 float g_pDirX = 1.0f, g_pDirY = 0.0f;
 float g_pPlaneX = 0.0f, g_pPlaneY = 0.66f;
 int g_hp = 100;
@@ -71,6 +57,85 @@ bool g_showMap = true;
 bool g_prevFireHigh = true;
 DoomEnemy g_enemies[DOOM_MAX_ENEMIES];
 DoomItem g_items[DOOM_MAX_ITEMS];
+
+void generateLevel() {
+  // Se conectan nueve salas abriendo puertas en orden aleatorio.
+  for (int y = 0; y < DOOM_MAP_H; ++y) {
+    for (int x = 0; x < DOOM_MAP_W; ++x) {
+      g_map[y][x] = (x % 5 == 0 || y % 5 == 0) ? static_cast<uint8_t>(random(1, 4)) : 0;
+    }
+  }
+
+  struct Door { int from, to, x, y; };
+  Door doors[12];
+  int count = 0;
+  for (int room = 0; room < 9; ++room) {
+    const int x = room % 3 * 5;
+    const int y = room / 3 * 5;
+    if (room % 3 < 2) doors[count++] = {room, room + 1, x + 5, y + 2};
+    if (room / 3 < 2) doors[count++] = {room, room + 3, x + 2, y + 5};
+  }
+
+  int group[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  int loops = 0;
+  while (count > 0) {
+    const int pick = random(count);
+    const Door door = doors[pick];
+    doors[pick] = doors[--count];
+    const int from = group[door.from], to = group[door.to];
+    if (from == to) {
+      if (loops++ < 2) g_map[door.y][door.x] = 0;
+      continue;
+    }
+    g_map[door.y][door.x] = 0;
+    for (int& id : group) {
+      if (id == to) id = from;
+    }
+  }
+  const int portalOffset = random(11, 15);
+  if (random(2)) g_map[portalOffset][15] = 4;
+  else g_map[15][portalOffset] = 4;
+
+  int rooms[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  for (int i = 7; i > 0; --i) {
+    const int j = random(i + 1);
+    const int saved = rooms[i];
+    rooms[i] = rooms[j];
+    rooms[j] = saved;
+  }
+  for (int i = 0; i < DOOM_MAX_ENEMIES; ++i) {
+    const int room = rooms[i];
+    const uint8_t species = (i + g_level) % 3;
+    g_enemies[i] = {room % 3 * 5 + 3.5f, room / 3 * 5 + 3.5f,
+                    static_cast<int8_t>(species == 1 ? 3 : 2), true, 0, 0, species};
+  }
+  for (int i = 0; i < DOOM_MAX_ITEMS; ++i) {
+    const int room = rooms[(i + 4) % 8];
+    g_items[i] = {room % 3 * 5 + 1.5f, room / 3 * 5 + 1.5f,
+                  static_cast<uint8_t>(i % 2 + 1), true};
+  }
+}
+
+uint8_t tileAt(float x, float y) {
+  if (x < 0 || y < 0 || x >= DOOM_MAP_W || y >= DOOM_MAP_H) return 1;
+  return g_map[static_cast<int>(y)][static_cast<int>(x)];
+}
+
+bool canWalk(float x, float y) {
+  constexpr float radius = 0.18f;
+  return !tileAt(x - radius, y - radius) && !tileAt(x + radius, y - radius)
+      && !tileAt(x - radius, y + radius) && !tileAt(x + radius, y + radius);
+}
+
+bool clearPath(float x, float y, float endX, float endY) {
+  const float dx = endX - x, dy = endY - y;
+  const int steps = 1 + static_cast<int>(fmaxf(fabsf(dx), fabsf(dy)) * 10);
+  for (int i = 1; i < steps; ++i) {
+    const float t = static_cast<float>(i) / steps;
+    if (tileAt(x + dx * t, y + dy * t)) return false;
+  }
+  return true;
+}
 
 inline uint16_t scaleRgb565(uint16_t c, uint8_t brightness) {
   uint16_t r = (((c >> 11) & 0x1F) * brightness) >> 8;
@@ -105,30 +170,34 @@ uint16_t sampleWallTex(uint8_t tile, int tx, int ty, bool darkSide, float dist) 
   return scaleRgb565(base, static_cast<uint8_t>(fog * 255.0f));
 }
 
-uint8_t impPixel(int x, int y) {
-  static const char* kImp[16] = {
-    "....3......3....",
-    "...33......33...",
-    "....11111111....",
-    "...1111111111...",
-    "...1133113311...",
-    "...1111111111...",
-    "....11222211....",
-    "..111111111111..",
-    ".11211111111211.",
-    ".1..11222211..1.",
-    "....11111111....",
-    "....112..211....",
-    "...111....111...",
-    "...112....211...",
-    "..222......222..",
-    "................"
+uint8_t creaturePixel(int x, int y, uint8_t species, bool frame, bool attacking) {
+  // El Vigia, la Medusa y la Mascara.
+  static const char art[3][16][17] = {
+    {
+      "......2222......", "....22111122....", "...2111111112...", "..211333311112..",
+      "..211333311112..", "..211111111112..", "...2112222112...", "....11222211....",
+      "...2112112112...", "..211.2112.112..", "..11..2112..11..", ".11...2112...11.",
+      ".12...2..2...21.", "..2..22..22..2..", ".....2....2.....", "................"
+    }, {
+      ".......22.......", "......2112......", "...2.211112.2...", "..222133312222..",
+      ".21111333111112.", "..221111111122..", "...2221111222...", ".22..212212..22.",
+      ".1..212..212..1.", "....12....21....", "...12.1221.21...", "...1..2..2..1...",
+      "..1..2....2..1..", ".....2....2.....", "................", "................"
+    }, {
+      "...2...22...2...", "..221221122122..", "..211111111112..", ".21133113311112.",
+      ".21133113311112.", ".21111111111112.", "..222133312222..", "...2111111112...",
+      "...2112112112...", "..211.2112.112..", ".211..2112..112.", ".11..211112..11.",
+      ".2...21..12...2.", ".....12..21.....", "....22....22....", "................"
+    }
   };
-  char ch = kImp[y & 15][x & 15];
-  if (ch == '1') return 1;
-  if (ch == '2') return 2;
-  if (ch == '3') return 3;
-  return 0;
+
+  if (y >= 8 && frame) {
+    if (x < 6) ++x;
+    else if (x > 9) --x;
+  }
+  const char pixel = art[species][y][x];
+  if (pixel == '3' && frame && !attacking && y == 4) return 1;
+  return pixel == '.' ? 0 : pixel - '0';
 }
 
 uint8_t itemPixel(int x, int y, uint8_t type) {
@@ -146,10 +215,10 @@ void drawHud() {
   g_tft.fillRect(0, 0, SCREEN_W, 22, g_theme.bg);
   g_tft.drawFastHLine(0, 21, SCREEN_W, g_theme.dim);
   g_tft.setCursor(6, 7);
-  printEs("DOOM // E1M1 HANGAR", g_theme.bright, 1);
+  printEs("Lily DOOM", g_theme.bright, 1);
 
   char topBuf[32];
-  snprintf(topBuf, sizeof(topBuf), "DEMONS:%d/%d", g_kills, DOOM_MAX_ENEMIES);
+  snprintf(topBuf, sizeof(topBuf), "ENTES:%d/%d", g_kills, DOOM_MAX_ENEMIES);
   g_tft.setCursor(166, 7);
   printEs(topBuf, g_theme.glow, 1);
   g_tft.setCursor(262, 7);
@@ -169,12 +238,13 @@ void drawHud() {
   printEs(hudBuf, g_ammo == 0 ? 0xF800 : g_theme.bright, 2);
 
   g_tft.setCursor(236, 207);
-  printEs("E1M1", g_theme.mid, 1);
+  snprintf(hudBuf, sizeof(hudBuf), "NIVEL %lu", static_cast<unsigned long>(g_level));
+  printEs(hudBuf, g_theme.mid, 1);
   g_tft.setCursor(236, 217);
   printEs("[A]Dispara", g_theme.dim, 1);
 
   g_tft.setCursor(6, 229);
-  printEs("[↑↓←→]Mover [A]Fuego [ST]Mapa [B]Menú", g_theme.dim, 1);
+  printEs("Arr/Ab: mover  Izq/Der: girar  START: mapa", g_theme.dim, 1);
 }
 
 void drawEndOverlay(bool victory) {
@@ -184,7 +254,7 @@ void drawEndOverlay(bool victory) {
   g_tft.fillRect(bx + 2, by + 2, bw - 4, 24, victory ? g_theme.selBg : 0x4000);
 
   g_tft.setCursor(bx + (victory ? 20 : 54), by + 7);
-  printEs(victory ? "NIVEL 1 LISTO!" : "HAS MUERTO", victory ? g_theme.glow : 0xF800, 2);
+  printEs(victory ? "PORTAL ABIERTO" : "HAS MUERTO", victory ? g_theme.glow : 0xF800, 2);
 
   const uint32_t sec = (millis() - g_startMs) / 1000;
   char buf[40];
@@ -194,7 +264,7 @@ void drawEndOverlay(bool victory) {
   printEs(buf, g_theme.bright, 1);
 
   g_tft.setCursor(bx + 36, by + 64);
-  printEs("[A] Jugar E1M1 otra vez", g_theme.glow, 1);
+  printEs(victory ? "[A] Siguiente nivel" : "[A] Nueva partida", g_theme.glow, 1);
   g_tft.setCursor(bx + 36, by + 82);
   printEs("[B] Volver al menú", g_theme.mid, 1);
 }
@@ -215,11 +285,10 @@ void fireShotgun() {
     const float fwd = dx * g_pDirX + dy * g_pDirY;
     if (fwd <= 0.25f || fwd > 9.0f) continue;
     const float side = fabsf(dx * (-g_pDirY) + dy * g_pDirX);
-    if (side < 0.45f && fwd < bestDist) {
-      if (fwd < g_zBuf[DOOM_W / 2] + 0.15f) {
-        bestDist = fwd;
-        bestIdx = i;
-      }
+    if (side < 0.45f && fwd < bestDist &&
+        clearPath(g_pX, g_pY, g_enemies[i].x, g_enemies[i].y)) {
+      bestDist = fwd;
+      bestIdx = i;
     }
   }
 
@@ -228,20 +297,20 @@ void fireShotgun() {
     g_enemies[bestIdx].hurtFrames = 4;
     const float pushX = g_enemies[bestIdx].x + g_pDirX * 0.22f;
     const float pushY = g_enemies[bestIdx].y + g_pDirY * 0.22f;
-    if (kDoomMap[static_cast<int>(pushY)][static_cast<int>(pushX)] == 0) {
+    if (canWalk(pushX, pushY)) {
       g_enemies[bestIdx].x = pushX;
       g_enemies[bestIdx].y = pushY;
     }
     if (g_enemies[bestIdx].hp <= 0) {
       g_enemies[bestIdx].alive = false;
       g_kills++;
-      Serial.printf("[DOOM] Demonio eliminado! (%d/%d)\n", g_kills, DOOM_MAX_ENEMIES);
+      Serial.printf("[Lily DOOM] Ente eliminado (%d/%d)\n", g_kills, DOOM_MAX_ENEMIES);
     }
   }
   drawHud();
 }
 
-void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash) {
+void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash, bool frame = false, bool attacking = false) {
   const float relX = sx - g_pX;
   const float relY = sy - g_pY;
   const float invDet = 1.0f / (g_pPlaneX * g_pDirY - g_pDirX * g_pPlaneY);
@@ -254,8 +323,9 @@ void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash)
   if (spriteH > DOOM_H * 2) spriteH = DOOM_H * 2;
   int spriteW = spriteH;
 
-  int drawStartY = -spriteH / 2 + DOOM_H / 2;
-  int drawEndY   =  spriteH / 2 + DOOM_H / 2;
+  const int bob = isEnemy && param == 1 && frame ? spriteH / 14 : 0;
+  int drawStartY = -spriteH / 2 + DOOM_H / 2 - bob;
+  int drawEndY   =  spriteH / 2 + DOOM_H / 2 - bob;
   if (drawStartY < 0) drawStartY = 0;
   if (drawEndY >= DOOM_H) drawEndY = DOOM_H - 1;
 
@@ -275,19 +345,19 @@ void drawSprite(float sx, float sy, bool isEnemy, uint8_t param, bool hurtFlash)
     if (texX < 0 || texX >= 16) continue;
 
     for (int y = drawStartY; y <= drawEndY; ++y) {
-      const int d = y * 256 - DOOM_H * 128 + spriteH * 128;
+      const int d = (y + bob) * 256 - DOOM_H * 128 + spriteH * 128;
       const int texY = ((d * 16) / spriteH) / 256;
       if (texY < 0 || texY >= 16) continue;
 
-      const uint8_t pix = isEnemy ? impPixel(texX, texY) : itemPixel(texX, texY, param);
+      const uint8_t pix = isEnemy ? creaturePixel(texX, texY, param, frame, attacking) : itemPixel(texX, texY, param);
       if (pix == 0) continue;
 
       uint16_t col = 0;
       if (isEnemy) {
+        constexpr uint16_t bodies[] = {0x64B2, 0xB1B9, 0xA54C};
         if (hurtFlash) col = 0xFFFF;
-        else if (pix == 3) col = 0xFFE0;
-        else if (pix == 2) col = scaleRgb565(0x7800, br);
-        else col = scaleRgb565(0xD180, br);
+        else if (pix == 3) col = attacking ? 0xF983 : 0xFF53;
+        else col = scaleRgb565(bodies[param], pix == 2 ? br / 2 : br);
       } else {
         if (param == 1) col = (pix == 3) ? 0xF800 : ((pix == 2) ? g_theme.dim : 0xFFFF);
         else col = (pix == 3) ? 0xFFE0 : ((pix == 2) ? g_theme.dark : g_theme.bright);
@@ -338,7 +408,7 @@ void drawWeaponAndOverlay() {
     const int my0 = 2;
     for (int my = 0; my < DOOM_MAP_H; ++my) {
       for (int mx = 0; mx < DOOM_MAP_W; ++mx) {
-        const uint8_t tile = kDoomMap[my][mx];
+        const uint8_t tile = g_map[my][mx];
         const uint16_t c = (tile == 4) ? 0x07E0 : (tile ? g_theme.dim : g_theme.bg);
         for (int dy = 0; dy < 2; ++dy) {
           for (int dx = 0; dx < 2; ++dx) {
@@ -376,31 +446,23 @@ void updateAndRenderFrame() {
   if (dt > 0.1f) dt = 0.1f;
   g_lastFrameMs = now;
 
-  const float moveSpd = 3.2f * dt;
-  const float rotSpd  = 2.3f * dt;
-
-  if (digitalRead(BTN_UP) == LOW) {
-    const float nx = g_pX + g_pDirX * moveSpd;
-    const float ny = g_pY + g_pDirY * moveSpd;
-    if (kDoomMap[static_cast<int>(g_pY)][static_cast<int>(nx)] == 0) g_pX = nx;
-    if (kDoomMap[static_cast<int>(ny)][static_cast<int>(g_pX)] == 0) g_pY = ny;
-
-    const int fx = static_cast<int>(g_pX + g_pDirX * 0.45f);
-    const int fy = static_cast<int>(g_pY + g_pDirY * 0.45f);
-    if (fx >= 0 && fx < DOOM_MAP_W && fy >= 0 && fy < DOOM_MAP_H && kDoomMap[fy][fx] == 4) {
+  const float rotSpd = 2.3f * dt;
+  const int move = static_cast<int>(inputButtonHeld(BTN_UP)) - inputButtonHeld(BTN_DOWN);
+  if (move != 0) {
+    const float step = move * 3.2f * dt;
+    const float nx = g_pX + g_pDirX * step;
+    const float ny = g_pY + g_pDirY * step;
+    if (canWalk(nx, g_pY)) g_pX = nx;
+    if (canWalk(g_pX, ny)) g_pY = ny;
+    if (move > 0 && tileAt(g_pX + g_pDirX * 0.55f, g_pY + g_pDirY * 0.55f) == 4) {
       g_win = true;
       drawEndOverlay(true);
-      Serial.printf("[DOOM] NIVEL 1 COMPLETADO! Bajas=%d/%d\n", g_kills, DOOM_MAX_ENEMIES);
+      Serial.printf("[Lily DOOM] Nivel %lu completado. Bajas=%d/%d\n",
+                    static_cast<unsigned long>(g_level), g_kills, DOOM_MAX_ENEMIES);
       return;
     }
   }
-  if (digitalRead(BTN_DOWN) == LOW) {
-    const float nx = g_pX - g_pDirX * moveSpd;
-    const float ny = g_pY - g_pDirY * moveSpd;
-    if (kDoomMap[static_cast<int>(g_pY)][static_cast<int>(nx)] == 0) g_pX = nx;
-    if (kDoomMap[static_cast<int>(ny)][static_cast<int>(g_pX)] == 0) g_pY = ny;
-  }
-  if (digitalRead(BTN_LEFT) == LOW) {
+  if (inputButtonHeld(BTN_LEFT)) {
     const float oldDirX = g_pDirX;
     const float oldPlX = g_pPlaneX;
     const float c = cosf(-rotSpd), s = sinf(-rotSpd);
@@ -409,7 +471,7 @@ void updateAndRenderFrame() {
     g_pPlaneX = g_pPlaneX * c - g_pPlaneY * s;
     g_pPlaneY = oldPlX * s + g_pPlaneY * c;
   }
-  if (digitalRead(BTN_RIGHT) == LOW) {
+  if (inputButtonHeld(BTN_RIGHT)) {
     const float oldDirX = g_pDirX;
     const float oldPlX = g_pPlaneX;
     const float c = cosf(rotSpd), s = sinf(rotSpd);
@@ -450,14 +512,15 @@ void updateAndRenderFrame() {
     const float dx = g_pX - g_enemies[i].x;
     const float dy = g_pY - g_enemies[i].y;
     const float distSq = dx * dx + dy * dy;
-    if (distSq < 36.0f && distSq > 0.75f) {
+    if (distSq < 36.0f && distSq > 0.85f) {
       const float invD = 1.0f / sqrtf(distSq);
       const float step = 0.85f * dt;
       const float ex = g_enemies[i].x + dx * invD * step;
       const float ey = g_enemies[i].y + dy * invD * step;
-      if (kDoomMap[static_cast<int>(g_enemies[i].y)][static_cast<int>(ex)] == 0) g_enemies[i].x = ex;
-      if (kDoomMap[static_cast<int>(ey)][static_cast<int>(g_enemies[i].x)] == 0) g_enemies[i].y = ey;
-    } else if (distSq <= 0.85f && (now - g_enemies[i].lastAtkMs) >= 950) {
+      if (canWalk(ex, g_enemies[i].y)) g_enemies[i].x = ex;
+      if (canWalk(g_enemies[i].x, ey)) g_enemies[i].y = ey;
+    } else if (distSq <= 0.85f && (now - g_enemies[i].lastAtkMs) >= 950 &&
+               clearPath(g_enemies[i].x, g_enemies[i].y, g_pX, g_pY)) {
       g_enemies[i].lastAtkMs = now;
       g_hp -= 12;
       if (g_hp < 0) g_hp = 0;
@@ -467,7 +530,7 @@ void updateAndRenderFrame() {
         g_dead = true;
         drawHud();
         drawEndOverlay(false);
-        Serial.println(F("[DOOM] HAS MUERTO en E1M1."));
+        Serial.println(F("[Lily DOOM] Fin de la partida."));
         return;
       }
     }
@@ -524,7 +587,7 @@ void updateAndRenderFrame() {
       if (mapX < 0 || mapX >= DOOM_MAP_W || mapY < 0 || mapY >= DOOM_MAP_H) {
         hitTile = 1;
       } else {
-        hitTile = kDoomMap[mapY][mapX];
+        hitTile = g_map[mapY][mapX];
       }
     }
 
@@ -573,7 +636,9 @@ void updateAndRenderFrame() {
   for (int i = 0; i < count; ++i) {
     if (list[i].isEnemy) {
       const DoomEnemy& e = g_enemies[list[i].idx];
-      drawSprite(e.x, e.y, true, 0, e.hurtFrames > 0);
+      const bool attacking = e.lastAtkMs != 0 && now - e.lastAtkMs < 220;
+      const bool frame = attacking || ((now / 170 + list[i].idx) & 1);
+      drawSprite(e.x, e.y, true, e.species, e.hurtFrames > 0, frame, attacking);
     } else {
       const DoomItem& it = g_items[list[i].idx];
       drawSprite(it.x, it.y, false, it.type, false);
@@ -612,9 +677,9 @@ void doomRenderFull() {
   else if (g_win) drawEndOverlay(true);
 }
 
-void doomStart() {
-  g_pX = 2.5f;
-  g_pY = 2.5f;
+static void startLevel() {
+  g_pX = START_X;
+  g_pY = START_Y;
   g_pDirX = 1.0f;
   g_pDirY = 0.0f;
   g_pPlaneX = 0.0f;
@@ -630,20 +695,16 @@ void doomStart() {
   g_lastFrameMs = g_startMs;
   g_prevFireHigh = (digitalRead(BTN_A) == HIGH);
 
-  g_enemies[0] = {  8.5f,  2.5f, 2, true, 0, 0 };
-  g_enemies[1] = {  4.5f,  7.5f, 2, true, 0, 0 };
-  g_enemies[2] = {  9.5f,  8.5f, 2, true, 0, 0 };
-  g_enemies[3] = { 13.5f,  7.5f, 2, true, 0, 0 };
-  g_enemies[4] = {  8.5f, 13.5f, 2, true, 0, 0 };
-  g_enemies[5] = { 13.5f,  3.5f, 3, true, 0, 0 };
-
-  g_items[0] = {  2.5f, 13.5f, 1, true };
-  g_items[1] = { 14.2f, 13.5f, 2, true };
-  g_items[2] = {  8.5f,  6.5f, 2, true };
-  g_items[3] = { 11.5f,  2.5f, 1, true };
-
+  g_lastShotMs = g_startMs - 260;
+  generateLevel();
   doomRenderFull();
-  Serial.println(F("[DOOM] Nivel E1M1 Hangar iniciado."));
+  Serial.printf("[Lily DOOM] Nivel %lu generado. Avanzar GPIO %d, retroceder GPIO %d.\n",
+                static_cast<unsigned long>(g_level), BTN_UP, BTN_DOWN);
+}
+
+void doomStart() {
+  g_level = 1;
+  startLevel();
 }
 
 bool doomHandleButton(int pin) {
@@ -651,7 +712,12 @@ bool doomHandleButton(int pin) {
 
   if (g_dead || g_win) {
     if (pin == BTN_A || pin == BTN_START) {
-      doomStart();
+      if (g_win) {
+        ++g_level;
+        startLevel();
+      } else {
+        doomStart();
+      }
     }
     return false;
   }
