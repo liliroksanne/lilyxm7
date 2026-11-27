@@ -3,6 +3,7 @@
 #include "board_config.h"
 #include "display_driver.h"
 #include "input_buttons.h"
+#include "lily_sprites.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -55,12 +56,25 @@ constexpr uint32_t KATANA_COOLDOWN_MS = 340;
 constexpr uint32_t DASH_COOLDOWN_MS = 650;
 constexpr uint32_t DEATH_MS = 440;
 constexpr uint32_t WINDUP_MS = 560;
-constexpr uint16_t TEMPLE_VOID = 0x100B;
-constexpr uint16_t TEMPLE_STONE = 0x2910;
-constexpr uint16_t TEMPLE_METAL = 0x4937;
-constexpr uint16_t TEMPLE_NEON = 0xC31F;
-constexpr uint16_t TEMPLE_CYAN = 0x46BD;
+constexpr uint16_t TEMPLE_VOID = THEME_PINK.bg;
+constexpr uint16_t TEMPLE_STONE = THEME_PINK.dark;
+constexpr uint16_t TEMPLE_METAL = THEME_PINK.dim;
+constexpr uint16_t TEMPLE_NEON = THEME_PINK.mid;
+constexpr uint16_t TEMPLE_LIGHT = THEME_PINK.glow;
 constexpr uint16_t ATTACK_WARNING = 0xFDA3;
+constexpr uint16_t HAND_OUTLINE = 0x49A6;
+constexpr uint16_t HAND_SHADE = 0xA38C;
+constexpr uint16_t HAND_SKIN = 0xD555;
+constexpr uint16_t HAND_LIGHT = 0xF6BB;
+constexpr uint16_t HAND_NAIL = 0xCB55;
+constexpr uint32_t PROLOGUE_MS = 14000;
+
+enum class DoomPhase : uint8_t { Title, Prologue, Playing };
+DoomPhase g_phase = DoomPhase::Title;
+LilyPose g_portraitPose = LilyPose::Guardia;
+uint32_t g_prologueMs = 0;
+float g_stride = 0.0f;
+float g_strideBlend = 0.0f;
 uint32_t g_lastSwingMs = 0;
 bool g_katanaPending = false;
 uint32_t g_lastDashMs = 0;
@@ -221,7 +235,7 @@ uint16_t sampleWallTex(uint8_t tile, int tx, int ty, bool darkSide, float dist) 
     const bool trim = tx == 2 || tx == 13;
     const bool panel = tx >= 4 && tx <= 11 && ty >= 2 && ty <= 13;
     const bool trace = (tx == 4 && ty < 10) || (ty == 9 && tx >= 4 && tx < 11);
-    base = trace ? TEMPLE_CYAN : trim ? TEMPLE_METAL : panel ? TEMPLE_STONE : TEMPLE_VOID;
+    base = trace ? TEMPLE_LIGHT : trim ? TEMPLE_METAL : panel ? TEMPLE_STONE : TEMPLE_VOID;
   } else if (tile == 2) {
     const int dx = abs(tx - 7), dy = abs(ty - 7);
     const bool sigil = dx * 2 + dy == 7 || (dx <= 1 && dy <= 1);
@@ -233,7 +247,7 @@ uint16_t sampleWallTex(uint8_t tile, int tx, int ty, bool darkSide, float dist) 
   } else {
     const bool frame = tx <= 2 || tx >= 13 || ty <= 1 || ty >= 14;
     const bool aperture = abs(tx - 7) * 2 + abs(ty - 7) < 9;
-    base = frame ? TEMPLE_CYAN : aperture ? TEMPLE_NEON : TEMPLE_VOID;
+    base = frame ? TEMPLE_LIGHT : aperture ? TEMPLE_NEON : TEMPLE_VOID;
   }
 
   float fog = 1.0f - (dist * 0.085f);
@@ -248,6 +262,32 @@ uint8_t itemPixel(int x, int y) {
   if (x == 5 || x == 26 || y == 19 || y == 29) return 2;
   if ((x >= 14 && x <= 17) || (y >= 23 && y <= 25 && x >= 10 && x <= 21)) return 3;
   return 1;
+}
+
+void drawLilySprite(LilyPose pose, int x, int y, int size, uint16_t background) {
+  const auto& sprite = LILY_SPRITES[static_cast<uint8_t>(pose)];
+  g_tft.startWrite();
+  g_tft.setAddrWindow(x, y, size, size);
+  for (int row = 0; row < size; ++row) {
+    const int source = (row * LILY_SPRITE_SIZE / size) * LILY_SPRITE_SIZE;
+    for (int col = 0; col < size; ++col) {
+      const uint16_t pixel = sprite[source + col * LILY_SPRITE_SIZE / size];
+      g_rowBuf[col] = pixel ? pixel : background;
+    }
+    g_tft.writePixels(g_rowBuf, size);
+  }
+  g_tft.endWrite();
+}
+
+LilyPose lilyCurrentPose(uint32_t now) {
+  if (g_dashRemaining > 0) return LilyPose::Dash;
+  if (now - g_lastSwingMs < KATANA_SWING_MS) return LilyPose::Tajo;
+  return LilyPose::Guardia;
+}
+
+void drawLilyPortrait(LilyPose pose) {
+  g_portraitPose = pose;
+  drawLilySprite(pose, 200, 203, 25, g_theme.bg);
 }
 
 void drawHud() {
@@ -281,6 +321,8 @@ void drawHud() {
   printEs(hudBuf, g_theme.mid, 1);
   g_tft.setCursor(236, 217);
   printEs("[A] Katana", g_theme.dim, 1);
+
+  drawLilyPortrait(lilyCurrentPose(millis()));
 
   g_tft.setCursor(6, 229);
   printEs("Arr/Ab: mover  Izq/Der: girar  START: mapa", g_theme.dim, 1);
@@ -388,10 +430,11 @@ void drawSprite(float sx, float sy, const DoomEnemy* enemy, uint32_t now) {
         if (deathAge && (texX * 17 + texY * 29) % DEATH_MS < deathAge) continue;
         const int index = ABYSS_SPRITES[enemy->species][texY][artX] - '0';
         if (!index) continue;
-        constexpr uint16_t violet[] = {0, 0x1808, 0x300E, 0x4815, 0x681B, 0x925F, 0xB39F, 0xDD7F};
+        constexpr uint16_t rose[] = {0, 0x2065, 0x3869, THEME_PINK.dim, 0x9290,
+                                     THEME_PINK.bright, THEME_PINK.glow, 0xF6BB};
         const int shade = (charging || lunge) && index < 6 ? index + 2 : index;
-        col = enemy->alive && enemy->hurtFrames ? violet[7] : scaleRgb565(violet[shade], br);
-        if (charging && index >= 5 && ((now / (pulse < 6 ? 110 : 65)) & 1)) col = violet[7];
+        col = enemy->alive && enemy->hurtFrames ? rose[7] : scaleRgb565(rose[shade], br);
+        if (charging && index >= 5 && ((now / (pulse < 6 ? 110 : 65)) & 1)) col = rose[7];
       } else {
         const uint8_t pixel = itemPixel(texX, texY);
         if (!pixel) continue;
@@ -419,7 +462,7 @@ void drawSprite(float sx, float sy, const DoomEnemy* enemy, uint32_t now) {
       const int dy = ((i * 53) % 17 - 8) * (2 + power) / 3 + power / 2;
       const int x = screenX + dx, y = coreY + dy;
       if (x >= 0 && x < DOOM_W && y >= 0 && y < DOOM_H && transY < g_zBuf[x]) {
-        g_fb[y * DOOM_W + x] = i % 3 ? TEMPLE_NEON : 0xDD7F;
+        g_fb[y * DOOM_W + x] = i % 3 ? TEMPLE_NEON : HAND_LIGHT;
       }
     }
   }
@@ -438,6 +481,43 @@ void weaponLine(int x0, int y0, int x1, int y1, uint16_t color) {
   }
 }
 
+void drawLeftHand() {
+  if (g_strideBlend < 0.04f) return;
+  constexpr const char* fist[] = {
+    ".......222........",
+    ".....2244422......",
+    "....245544442.....",
+    "...24554444442....",
+    "..245444444442....",
+    "..244443444442....",
+    "..24443444442.....",
+    "...244344422......",
+    "....2444422.......",
+    "....244422........",
+    "...244422.........",
+    "..224422..........",
+    "..21212...........",
+    ".212122...........",
+    "212112............",
+    "211122............"
+  };
+  constexpr uint16_t colors[] = {0, TEMPLE_METAL, HAND_OUTLINE, HAND_SHADE,
+                                 HAND_SKIN, HAND_NAIL};
+  const int x0 = 14 + lroundf(4.0f * cosf(g_stride));
+  const int y0 = DOOM_H - 2 - lroundf((15.0f + 8.0f * sinf(g_stride)) * g_strideBlend);
+  for (int y = 0; y < 16; ++y) {
+    for (int x = 0; x < 18; ++x) {
+      const char pixel = fist[y][x];
+      if (pixel != '.') weaponLine(x0 + x, y0 + y, x0 + x, y0 + y, colors[pixel - '0']);
+    }
+  }
+  const int cuffY = y0 + 14;
+  for (int w = 0; w < 11; ++w) {
+    weaponLine(x0 + w, cuffY, x0 + w - 11, DOOM_H + 2,
+               w == 0 || w == 10 ? HAND_OUTLINE : (w < 3 ? TEMPLE_NEON : TEMPLE_METAL));
+  }
+}
+
 void drawKatana(uint32_t now) {
   // Poses: guardia, anticipacion, corte diagonal, seguimiento y regreso.
   struct Pose { int x, y, angle; };
@@ -449,8 +529,9 @@ void drawKatana(uint32_t now) {
   const float f = progress - index;
   const Pose& a = poses[index];
   const Pose& b = poses[index + 1];
-  const int x = lroundf(a.x + (b.x - a.x) * f);
-  const int y = lroundf(a.y + (b.y - a.y) * f) + (g_dashRemaining > 0 ? 5 : 0);
+  const int x = lroundf(a.x + (b.x - a.x) * f + 2.0f * cosf(g_stride) * g_strideBlend);
+  const int y = lroundf(a.y + (b.y - a.y) * f + 3.0f * sinf(g_stride) * g_strideBlend)
+                + (g_dashRemaining > 0 ? 5 : 0);
   const float angle = (a.angle + (b.angle - a.angle) * f) * 0.017453293f;
   const float ux = cosf(angle), uy = sinf(angle);
   const float vx = -uy, vy = ux;
@@ -465,21 +546,37 @@ void drawKatana(uint32_t now) {
       const int endX = lroundf(x + cosf(trail) * (57 + i * 2));
       const int endY = lroundf(y + sinf(trail) * (57 + i * 2));
       weaponLine(endX, endY, lroundf(endX + vx * 10), lroundf(endY + vy * 10),
-                 i == 0 ? TEMPLE_CYAN : i == 1 ? TEMPLE_NEON : TEMPLE_METAL);
+                 i == 0 ? TEMPLE_LIGHT : i == 1 ? TEMPLE_NEON : TEMPLE_METAL);
     }
   }
 
   for (int w = -3; w <= 3; ++w) {
     line(-15, w, -2, w, abs(w) == 3 ? TEMPLE_METAL : TEMPLE_VOID);
-    line(2, w, 43, w, w == -3 ? 0xDEBF : w == -2 ? TEMPLE_CYAN :
-                         w == 2 ? TEMPLE_NEON : w == 3 ? TEMPLE_METAL : 0x6B39);
-    line(43, w, 52, -3, w <= -2 ? 0xDEBF : TEMPLE_METAL);
+    line(2, w, 43, w, w == -3 ? HAND_LIGHT : w == -2 ? TEMPLE_LIGHT :
+                         w == 2 ? TEMPLE_NEON : w == 3 ? TEMPLE_METAL : THEME_PINK.bright);
+    line(43, w, 52, -3, w <= -2 ? HAND_LIGHT : TEMPLE_METAL);
   }
   for (int grip = -13; grip < -3; grip += 4) line(grip, -2, grip + 2, 2, TEMPLE_NEON);
-  line(-15, -3, -15, 3, TEMPLE_CYAN);
+  line(-15, -3, -15, 3, TEMPLE_LIGHT);
   line(-1, -7, 1, 7, TEMPLE_METAL);
   line(0, -7, 2, 7, TEMPLE_NEON);
-  line(3, 0, 9, 0, TEMPLE_CYAN);
+  line(3, 0, 9, 0, TEMPLE_LIGHT);
+
+  // Mano derecha anclada a la empunadura durante todo el tajo.
+  const int gripX = lroundf(x - ux * 8), gripY = lroundf(y - uy * 8);
+  for (int w = -5; w <= 5; ++w) {
+    const uint16_t sleeve = abs(w) == 5 ? HAND_OUTLINE : w < 0 ? TEMPLE_METAL : TEMPLE_NEON;
+    weaponLine(gripX + w, gripY + 4, gripX + 8 + w * 2, DOOM_H + 4, sleeve);
+  }
+  for (int finger = -12; finger <= -4; finger += 2) {
+    line(finger, -5, finger + 1, 4, HAND_OUTLINE);
+    line(finger, -4, finger, 3, finger == -12 ? HAND_SHADE : HAND_SKIN);
+    line(finger, -4, finger, -2, HAND_LIGHT);
+    if (finger < -4) line(finger, 2, finger, 3, HAND_NAIL);
+  }
+  line(-5, -6, -3, 1, HAND_OUTLINE);
+  line(-5, -5, -3, 0, HAND_LIGHT);
+  line(-9, 4, -8, 4, THEME_PINK.glow);
 }
 
 void drawWeaponAndOverlay(uint32_t now) {
@@ -490,12 +587,13 @@ void drawWeaponAndOverlay(uint32_t now) {
     g_fb[(cy + i) * DOOM_W + cx] = g_theme.glow;
   }
 
+  drawLeftHand();
   drawKatana(now);
   if (g_dashRemaining > 0) {
     for (int y = 14; y < 80; y += 13) {
       for (int x = 2; x < 13; ++x) {
-        g_fb[y * DOOM_W + x] = 0x925F;
-        g_fb[y * DOOM_W + DOOM_W - 1 - x] = 0x925F;
+        g_fb[y * DOOM_W + x] = TEMPLE_NEON;
+        g_fb[y * DOOM_W + DOOM_W - 1 - x] = TEMPLE_NEON;
       }
     }
   }
@@ -506,7 +604,7 @@ void drawWeaponAndOverlay(uint32_t now) {
     for (int my = 0; my < DOOM_MAP_H; ++my) {
       for (int mx = 0; mx < DOOM_MAP_W; ++mx) {
         const uint8_t tile = g_map[my][mx];
-        const uint16_t c = (tile == 4) ? TEMPLE_CYAN : (tile ? TEMPLE_VOID : TEMPLE_METAL);
+        const uint16_t c = (tile == 4) ? TEMPLE_LIGHT : (tile ? TEMPLE_VOID : TEMPLE_METAL);
         for (int dy = 0; dy < 2; ++dy) {
           for (int dx = 0; dx < 2; ++dx) {
             g_fb[(my0 + my * 2 + dy) * DOOM_W + (mx0 + mx * 2 + dx)] = c;
@@ -564,6 +662,7 @@ void updateAndRenderFrame() {
   if (dt > 0.1f) dt = 0.1f;
   g_lastFrameMs = now;
 
+  const float previousX = g_pX, previousY = g_pY;
   const bool dashing = g_dashRemaining > 0.0f;
   if (dashing) {
     const float distance = fminf(dt * 10.0f, g_dashRemaining);
@@ -594,6 +693,10 @@ void updateAndRenderFrame() {
       return;
     }
   }
+  const float travel = hypotf(g_pX - previousX, g_pY - previousY);
+  const float blendTarget = travel > 0.001f ? 1.0f : 0.0f;
+  g_strideBlend += (blendTarget - g_strideBlend) * fminf(dt * 14.0f, 1.0f);
+  g_stride = fmodf(g_stride + travel * 6.0f, 6.2831853f);
   if (inputButtonHeld(BTN_LEFT)) {
     const float oldDirX = g_pDirX;
     const float oldPlX = g_pPlaneX;
@@ -679,7 +782,7 @@ void updateAndRenderFrame() {
     for (int x = 0; x < DOOM_W; ++x) {
       const int depth = y - DOOM_H / 2;
       const bool seam = depth > 5 && (depth % 12 == 0 || (abs(x - DOOM_W / 2) * 8) % depth < 2);
-      dst[x] = seam ? scaleRgb565(TEMPLE_CYAN, depth + 12) : rowCol;
+      dst[x] = seam ? scaleRgb565(TEMPLE_LIGHT, depth + 12) : rowCol;
     }
   }
 
@@ -793,12 +896,61 @@ void updateAndRenderFrame() {
   }
   g_tft.endWrite();
 
-  if (hudDirty) drawHud();
+  if (hudDirty) {
+    drawHud();
+  } else {
+    const LilyPose pose = lilyCurrentPose(now);
+    if (pose != g_portraitPose) drawLilyPortrait(pose);
+  }
+}
+
+void drawIntro() {
+  g_tft.fillScreen(THEME_PINK.bg);
+  g_tft.drawRect(12, 12, SCREEN_W - 24, SCREEN_H - 24, THEME_PINK.dim);
+  g_tft.drawFastHLine(25, 32, SCREEN_W - 50, THEME_PINK.dark);
+  g_tft.drawFastHLine(25, 206, SCREEN_W - 50, THEME_PINK.dark);
+
+  if (g_phase == DoomPhase::Title) {
+    drawLilySprite(LilyPose::Guardia, 24, 51, 128, THEME_PINK.bg);
+    g_tft.setCursor(162, 76);
+    printEs("Lily DOOM", THEME_PINK.glow, 2);
+    g_tft.setCursor(162, 102);
+    printEs("La katana maldita", THEME_PINK.bright, 1);
+    g_tft.drawFastHLine(162, 119, 110, THEME_PINK.dim);
+    g_tft.setCursor(162, 140);
+    printEs("[START] Iniciar", THEME_PINK.glow, 1);
+  } else {
+    g_tft.setCursor(34, 46);
+    printEs("Año 2027", THEME_PINK.glow, 3);
+    constexpr const char* story[] = {
+      "Una IA intenta hackear",
+      "el mundo. Sus criaturas",
+      "salen de un vórtice.",
+      "Lily entra al templo",
+      "con la katana maldita",
+      "para cerrar el vórtice."
+    };
+    for (int i = 0; i < 6; ++i) {
+      g_tft.setCursor(34, 83 + i * 15);
+      printEs(story[i], THEME_PINK.bright, 1);
+    }
+    drawLilySprite(LilyPose::Tajo, 192, 79, 96, THEME_PINK.bg);
+    g_tft.setCursor(227, 177);
+    printEs("Lily", THEME_PINK.glow, 1);
+    g_tft.setCursor(34, 181);
+    printEs("[START] Entrar al templo", THEME_PINK.glow, 1);
+  }
+  g_tft.setCursor(217, 214);
+  printEs("[SELECT] Salir", THEME_PINK.mid, 1);
 }
 
 } // namespace
 
 void doomRenderFull() {
+  if (g_phase != DoomPhase::Playing) {
+    drawIntro();
+    return;
+  }
   g_tft.fillScreen(g_theme.bg);
   drawHud();
   if (g_dead) drawEndOverlay(false);
@@ -806,6 +958,9 @@ void doomRenderFull() {
 }
 
 static void startLevel() {
+  g_phase = DoomPhase::Playing;
+  g_stride = 0.0f;
+  g_strideBlend = 0.0f;
   g_pX = START_X;
   g_pY = START_Y;
   g_pDirX = 1.0f;
@@ -833,11 +988,25 @@ static void startLevel() {
 
 void doomStart() {
   g_level = 1;
-  startLevel();
+  g_phase = DoomPhase::Title;
+  doomRenderFull();
 }
 
 bool doomHandleButton(int pin) {
   if (pin == BTN_SELECT) return true;
+
+  if (g_phase == DoomPhase::Title) {
+    if (pin == BTN_START) {
+      g_phase = DoomPhase::Prologue;
+      g_prologueMs = millis();
+      doomRenderFull();
+    }
+    return false;
+  }
+  if (g_phase == DoomPhase::Prologue) {
+    if (pin == BTN_START) startLevel();
+    return false;
+  }
 
   if (g_dead || g_win) {
     if (pin == BTN_A || pin == BTN_START) {
@@ -845,7 +1014,8 @@ bool doomHandleButton(int pin) {
         ++g_level;
         startLevel();
       } else {
-        doomStart();
+        g_level = 1;
+        startLevel();
       }
     }
     return false;
@@ -869,6 +1039,11 @@ bool doomHandleButton(int pin) {
 }
 
 void doomTick() {
+  if (g_phase == DoomPhase::Prologue && millis() - g_prologueMs >= PROLOGUE_MS) startLevel();
+  if (g_phase != DoomPhase::Playing) {
+    delay(15);
+    return;
+  }
   if (!g_dead && !g_win) {
     updateAndRenderFrame();
   } else {
